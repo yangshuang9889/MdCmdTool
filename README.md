@@ -90,7 +90,7 @@
 ## 下载与运行
 
 1. 打开 [Releases](https://github.com/yangshuang9889/MdCmdTool/releases) 页；
-2. 下载最新版本的 `爽哥MD编辑工具.exe`；
+2. 下载最新版本的 `SgMdEditor-v1.6.0.exe`（后续版本同名规则 `SgMdEditor-<版本>.exe`），双击即用，无需安装；
 3. 双击运行。**免安装**，不需要 Python 环境，不需要任何运行库。
 
 > 系统要求：Windows 10 / 11（x64）。程序无代码签名，首次运行若被 SmartScreen 提示，可点「更多信息 → 仍要运行」；也可以按[从源码构建](#从源码构建)自行打包。

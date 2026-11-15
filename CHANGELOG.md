@@ -18,7 +18,7 @@
 
 **工程**
 
-- 新增 `scripts/verify_update_v160.py`：版本解析/比较用例、Release 返回体解析、真实接口连通性、配置清洗、源码静态约束共 26 项校验，全部 PASS；
+- 新增 `scripts/verify_update_v160.py`：版本解析/比较用例、Release 返回体解析、真实接口连通性、配置清洗、源码静态约束共 28 项校验，全部 PASS；
 - `build.bat` 重写为带存在性检查、依赖版本打印与完整清理的打包脚本；
 - 版本号同步至 `APP_VERSION` 与 `version_info.txt`（1.6.0.0）；
 - 仓库开源化：新增 `README.md`、`LICENSE`(MIT)、`CHANGELOG.md`、`SECURITY.md`、`CONTRIBUTING.md`、`.gitignore`、GitHub Actions 打包工作流。

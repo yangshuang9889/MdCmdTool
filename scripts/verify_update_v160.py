@@ -1,11 +1,11 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """v1.6.0 在线检查更新功能验证脚本（源码级，不启动界面）。
 
 覆盖点：
   1. 版本号常量与更新源地址是否正确指向开源仓库；
   2. parse_version / compare_version 的边界用例；
   3. parse_release_payload 对 GitHub 返回体的解析（含缺失字段、非法 tag）;
-  4. 连接真实 GitHub API：仓库尚无可发布版本时应抛 LookupError，网络异常应抛 RuntimeError；
+  4. 连接真实 GitHub API：有 Release 时应返回可解析版本，仓库暂无发布版本时应抛 LookupError，网络异常应抛 RuntimeError；
   5. 设置项 auto_check_update 默认关闭且能被清洗函数正确吸收。
 
 用法：python verify_update_v160.py
@@ -92,6 +92,11 @@ def main():
     try:
         real = mod.fetch_latest_release()
         check("真实 API 请求", True, "最新版本 %s" % real["version"])
+        parsed = mod.parse_version(real["version"])
+        check("远端版本可解析", parsed is not None, str(real["version"]))
+        cmp_result = mod.compare_version(mod.APP_VERSION, real["version"])
+        check("远端版本可比较（1/0/-1）", cmp_result in (1, 0, -1), "本机 %s vs 远端 %s -> %r"
+              % (mod.APP_VERSION, real["version"], cmp_result))
     except LookupError as exc:
         check("真实 API 请求（仓库暂无 Release 属正常）", True, str(exc))
     except RuntimeError as exc:
