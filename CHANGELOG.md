@@ -34,7 +34,8 @@
 - 新增 `scripts/fix_manual_lines_v2.py`：按「符号定义行 + 新旧源码 diff 行映射」双路重算开发手册行号引用，实测改写 622 处、校验 0 失败 0 越界；
 - 版本号同步至 `APP_VERSION` = `1.7.0` 与 `version_info.txt` = `1.7.0.0`；
 - 打包产出 `爽哥MD编辑工具.exe` 31,921,156 字节（FileVersion / ProductVersion = `1.7.0.0`），exe 端实测 5 项：相对路径图、绝对路径图正常显示，文件不存在 / 网络图按提示文字降级，普通链接不受影响；
-- 体积提示：因内置 Pillow，exe 由 v1.6.0 的 12,384,743 字节增至 31,921,156 字节；Pillow 为可选依赖，剔除后可回到约 13 MB，但 `JPG` / `BMP` / `WEBP` 将无法预览。
+- 体积提示：因内置 Pillow，exe 由 v1.6.0 的 12,384,743 字节增至 31,921,156 字节；Pillow 为可选依赖，剔除后可回到约 13 MB，但 `JPG` / `BMP` / `WEBP` 将无法预览；
+- 已发布 Release：[v1.7.0](https://github.com/yangshuang9889/MdCmdTool/releases/tag/v1.7.0)，资产 `SgMdEditor-v1.7.0.exe` 30,921,156 字节，经 GitHub API 核对与本地 exe 字节数一致。
 
 ## v1.6.0（2026-11-15）
 
