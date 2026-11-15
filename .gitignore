@@ -1,0 +1,31 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# ---------- PyInstaller 构建产物 ----------
+build/
+dist/
+*.spec
+*.manifest
+
+# ---------- 打包产物（由 Releases / Actions 分发，不入库） ----------
+*.exe
+
+# ---------- 本机运行数据 ----------
+settings.json
+instance.json
+logs/
+temp/
+
+# ---------- 历史版本本地留档 ----------
+archives/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

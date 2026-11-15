@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  verify-and-build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: 语法检查
+        run: python -m py_compile "爽哥MD命令生成工具.py"
+
+      - name: 功能验证（26 项）
+        run: python scripts\verify_update_v160.py
+
+      - name: 打包 exe
+        run: >
+          python -m PyInstaller --noconfirm --onefile --noconsole
+          --name "爽哥MD编辑工具" --icon app.ico
+          --add-data "app.ico;." --add-data "md_file.ico;."
+          --add-data "app_icon.png;." --add-data "md_file_icon.png;."
+          --version-file version_info.txt "爽哥MD命令生成工具.py"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SgMdEditor-windows
+          path: dist/爽哥MD编辑工具.exe
+          if-no-files-found: error
+
+      - name: 附加到 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/爽哥MD编辑工具.exe
+          generate_release_notes: true
