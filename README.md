@@ -1,4 +1,4 @@
-# 爽哥MD编辑工具 · SgMdEditor
+﻿# 爽哥MD编辑工具 · SgMdEditor
 
 [![Build](https://github.com/yangshuang9889/MdCmdTool/actions/workflows/build.yml/badge.svg)](https://github.com/yangshuang9889/MdCmdTool/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/yangshuang9889/MdCmdTool?include_prereleases&sort=semver)](https://github.com/yangshuang9889/MdCmdTool/releases)
@@ -53,10 +53,19 @@
 
 **Markdown 编辑**
 
-- 20 个语法按钮：`H1`~`H6`、加粗、斜体、删除线、行内代码、脚注、代码块、无序/有序/任务列表、引用、链接、图片、表格模板、分割线；
+- 21 个语法按钮（v1.7.0 增加「插入图片」）：`H1`~`H6`、加粗、斜体、删除线、行内代码、脚注、代码块、无序/有序/任务列表、引用、链接、图片、表格模板、分割线；
 - 支持**选中即套用**：先选文字再点按钮，直接在选区两端插入标记；脚注自动递增序号；
 - 三栏布局（左：命令录入 / 中：Markdown 源码 / 右：实时预览），任意一栏都能隐藏，`Ctrl+1/2/3` 切换，至少保留一栏；
 - 面板宽度、窗口位置与大小自动记住，下次打开还原原样。
+
+**图片显示（v1.7.0）**
+
+- 预览区把 `![说明](路径)` **渲染成真实图片**：`PNG` / `JPG` / `JPEG` / `GIF` / `BMP` / `WEBP` 都能直接看；
+- 相对路径以**当前文档所在目录**为基准，绝对路径与 `file:///` 写法同样支持，中文与含空格路径也能识别；
+- 按预览区宽度等比缩放（最大高度 480px），改窗口大小自动重排，图片不会撑破预览区；
+- 单击预览里的图片即用系统看图程序**打开原图**；
+- 工具栏新增 **插入图片** 按钮（`Ctrl+Shift+I`）：选好本地图片自动写入相对路径，路径含空格自动用 `<>` 包裹；
+- 网络图 / Base64 / 文件不存在时只显示一行提示文字，不影响其余内容渲染，也不会弹错误框。
 
 **主题与外观**
 
@@ -90,7 +99,7 @@
 ## 下载与运行
 
 1. 打开 [Releases](https://github.com/yangshuang9889/MdCmdTool/releases) 页；
-2. 下载最新版本的 `SgMdEditor-v1.6.0.exe`（后续版本同名规则 `SgMdEditor-<版本>.exe`），双击即用，无需安装；
+2. 下载最新版本的 `SgMdEditor-v1.7.0.exe`（后续版本同名规则 `SgMdEditor-<版本>.exe`），双击即用，无需安装；
 3. 双击运行。**免安装**，不需要 Python 环境，不需要任何运行库。
 
 > 系统要求：Windows 10 / 11（x64）。程序无代码签名，首次运行若被 SmartScreen 提示，可点「更多信息 → 仍要运行」；也可以按[从源码构建](#从源码构建)自行打包。
