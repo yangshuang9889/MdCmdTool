@@ -21,10 +21,12 @@ import re
 import sys
 import time
 import ctypes
+import hashlib
 import json
 import logging
 import queue
 import socket
+import subprocess
 import tempfile
 import threading
 import traceback
@@ -36,12 +38,14 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog
 from tkinter import messagebox
+from tkinter import simpledialog
 
 try:  # 仅 Windows 提供 winreg；缺失时文件关联功能降级为不可用
     import winreg
 except Exception:  # pragma: no cover
     winreg = None
 
+from urllib.parse import quote
 from urllib.parse import unquote
 
 try:  # 可选依赖：装了 Pillow 才能预览 JPG/BMP/WEBP 并做平滑缩放，缺失时退化为 Tk 原生格式
@@ -57,7 +61,7 @@ except Exception:  # pragma: no cover
 # 常量信息
 # ---------------------------------------------------------------------------
 APP_NAME = "爽哥MD编辑工具"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 AUTHOR = "杨爽"
 AI_TOOL = "Marvis"
 EMAIL = "675680672@qq.com"
@@ -78,6 +82,39 @@ IMAGE_PREVIEW_MAX_H = 480       # 单张图片在预览区的最大高度（像�
 IMAGE_PREVIEW_MARGIN = 56       # 预览区左右留白（内边距 + 滚动条）
 IMAGE_PREVIEW_MIN_W = 240       # 预览区过窄时的兜底宽度
 IMAGE_CACHE_LIMIT = 32          # 解码缓存条数上限，超出整体清空
+
+# 预览视频（v1.8.0）：识别 <iframe> / <video> / B 站链接 / 本地视频路径，
+# 单击预览里的「▶ 视频」条目，在预览区下方的内嵌面板里用系统 Edge（Chromium 内核）真播放。
+# 说明：tkinter Text 无法承载 HTML，因此播放器是嵌入在预览栏底部的子窗口，不是文本流内元素。
+VIDEO_EXTENSIONS = (".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv")
+VIDEO_PANEL_H = 250             # 内嵌播放面板默认高度（像素）
+VIDEO_EDGE_WAIT_MS = 12000      # 等待 Edge 播放窗口出现的最长时间（毫秒）
+VIDEO_WINDOW_POLL_MS = 250      # 轮询 Edge 播放窗口的间隔（毫秒）
+VIDEO_CACHE_DIR = "video_cache"  # 播放页与 Edge 独立配置目录（exe 同级）
+BILI_PLAYER_URL = ("https://player.bilibili.com/player.html?bvid=%s"
+                   "&page=1&autoplay=0&isOutside=true")
+BILI_IFRAME_TPL = (
+    '<iframe\n'
+    '  src="%s"\n'
+    '  title="哔哩哔哩视频播放器"\n'
+    '  allow="fullscreen; autoplay; encrypted-media; picture-in-picture"\n'
+    '  allowfullscreen\n'
+    '  loading="lazy"\n'
+    '  style="width:100%%; aspect-ratio:16/9; border:0;">\n'
+    '</iframe>'
+)
+VIDEO_TAG_TPL = '<video controls width="100%%" src="%s">\n</video>'
+PLAYER_PAGE_TPL = (
+    '<!doctype html>\n'
+    '<html><head><meta charset="utf-8"><title>视频播放</title>\n'
+    '<style>html,body{margin:0;height:100%%;background:#000;overflow:hidden}\n'
+    'iframe,video{width:100%%;height:100%%;border:0;display:block}</style></head>\n'
+    '<body>%s</body></html>'
+)
+# 嵌入外部窗口用到的 Win32 常量：去掉弹出式标题栏，改成子窗口样式
+GWL_STYLE = -16
+WIN_DROP_STYLE = 0x80000000 | 0x00C00000 | 0x00040000 | 0x00080000   # POPUP|CAPTION|THICKFRAME|SYSMENU
+WIN_CHILD_STYLE = 0x40000000 | 0x10000000                           # CHILD|VISIBLE
 
 # 在线检查更新（v1.6.0）：直接复用本项目的 GitHub 开源仓库 Releases 做版本比对，
 # 不依赖任何第三方更新服务器，也不上传任何本机信息。
@@ -696,6 +733,14 @@ _LIST_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
 _TASK_RE = re.compile(r"^\[([ xX])\]\s+(.*)$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 
+# 视频识别（v1.8.0）
+_VIDEO_ATTR_RE = re.compile(r'([\w:-]+)\s*=\s*"([^"]*)"')
+_VIDEO_SRC_RE = re.compile(r'<source\b[^>]*\bsrc\s*=\s*"([^"]+)"', re.I)
+_BILI_BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
+_BILI_PAGE_RE = re.compile(r"^https?://(?:[\w.-]+\.)?bilibili\.com/\S+$", re.I)
+_LOCAL_VIDEO_RE = re.compile(r"^(?:file:///)?[^\s]+\.(?:%s)$"
+                             % "|".join(ext.lstrip(".") for ext in VIDEO_EXTENSIONS), re.I)
+
 PREVIEW_TAG_ORDER = [
     ("normal", {"font": (FONT_CN, 10), "spacing3": 6}),
     ("h1", {"font": (FONT_CN, 18, "bold"), "spacing1": 14, "spacing3": 8,
@@ -726,6 +771,8 @@ PREVIEW_TAG_ORDER = [
     ("hint", {"font": (FONT_CN, 10, "italic"), "foreground": "#9aa5b1"}),
     ("img", {"spacing1": 6, "spacing3": 6}),
     ("imgfail", {"font": (FONT_CN, 9, "italic"), "foreground": "#b04a3a"}),
+    ("video", {"font": (FONT_CN, 10), "underline": 1, "lmargin1": 8,
+               "spacing1": 8, "spacing3": 8}),
 ]
 
 # 预览标签里需要随主题变化的键：标签名 -> 调色板中对应字段
@@ -733,6 +780,7 @@ _TAG_COLOR_MAP = {
     "h1": "h1_fg", "h2": "h2_fg", "h3": "h3_fg",
     "h4": "h4_fg", "h5": "h5_fg", "h6": "h6_fg",
     "link": "link_fg", "hr": "hr_fg", "hint": "hint_tag_fg",
+    "video": "link_fg",
 }
 
 
@@ -906,6 +954,256 @@ def image_insert_target(path, base_dir=None):
     return text
 
 
+def html_escape(text):
+    """把文本转义成可安全塞进 HTML 属性的字符串。"""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def file_url(path):
+    """本地绝对路径 → Edge 可直接打开的 file:/// URL（含空格/中文做百分号编码）。"""
+    text = os.path.abspath(path).replace("\\", "/")
+    return "file:///" + quote(text, safe="/:")
+
+
+def video_attrs(block):
+    """解析 <iframe>/<video> 标签属性 → dict（属性名统一小写）。"""
+    attrs = {}
+    head = re.match(r"<\s*(?:iframe|video)\b([^>]*)>", block or "", re.S | re.I)
+    if not head:
+        return attrs
+    for match in _VIDEO_ATTR_RE.finditer(head.group(1)):
+        attrs[match.group(1).lower()] = match.group(2) or ""
+    return attrs
+
+
+def video_source_of(block):
+    """从视频标记里取播放地址：iframe 取 src，video 取自身 src 或首个 <source src>。"""
+    src = (video_attrs(block).get("src") or "").strip()
+    if src:
+        return src
+    source = _VIDEO_SRC_RE.search(block or "")
+    if source:
+        return source.group(1).strip()
+    text = (block or "").strip()
+    # 不是标签片段就直接当地址（裸 B 站链接 / 本地路径都走这里）
+    return "" if "<" in text else text
+
+
+def classify_video(src, base_dir=None):
+    """视频地址归一化为 (kind, payload, label)。
+
+    kind 取值：bili（B 站视频，payload=bvid）/ web（网页播放器，payload=URL）
+    / local（本地视频，payload=绝对路径）/ bad（无法播放，label=原因）。
+    """
+    text = (src or "").strip()
+    if not text:
+        return ("bad", "", "没有视频地址")
+    bili_match = _BILI_BV_RE.search(text)
+    if bili_match and ("bilibili" in text.lower() or _BILI_BV_RE.fullmatch(text)):
+        bvid = bili_match.group(0)
+        # payload 保留完整播放地址（带 cid / page），才能精确定位分P
+        payload = bili_embed_src(text) or (BILI_PLAYER_URL % bvid)
+        return ("bili", payload, "B站 %s" % bvid)
+    if text.lower().startswith(("http://", "https://")):
+        host = text.split("//", 1)[-1].split("/")[0]
+        return ("web", text, host or "网页")
+    path = text
+    if path.lower().startswith("file:///"):
+        path = unquote(path[8:])
+        if re.match(r"^/[A-Za-z]:", path):
+            path = path[1:]
+    if not os.path.isabs(path):
+        path = os.path.join(base_dir or os.getcwd(), unquote(path))
+    path = os.path.normpath(path)
+    if os.path.isfile(path):
+        if os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS:
+            return ("local", path, os.path.basename(path))
+        return ("bad", "", "不是支持的视频格式：%s" % os.path.basename(path))
+    return ("bad", "", "文件不存在：%s" % os.path.basename(path))
+
+
+def html_block_complete(text):
+    """判断一段 HTML 片段是否已闭合（用于跨行收集 iframe / video 块）。"""
+    lowered = (text or "").lower()
+    if "<iframe" in lowered:
+        return "</iframe>" in lowered or re.search(r"<iframe\b[^>]*/>", text, re.I) is not None
+    if "<video" in lowered:
+        if "</video>" in lowered:
+            return True
+        return re.search(r"<video\b[^>]*/>", text, re.I) is not None
+    return True
+
+
+def looks_like_video_line(text, base_dir=None):
+    """整行是否就是一个视频地址（B 站链接 / BV 号 / 本地视频路径）——避免误伤普通段落。"""
+    value = (text or "").strip()
+    if not value or len(value) > 400:
+        return False
+    if _BILI_BV_RE.fullmatch(value) or _BILI_PAGE_RE.match(value):
+        return True
+    token = value.strip("<>")
+    if _BILI_PAGE_RE.match(token):
+        return True
+    if " " in value:
+        # 路径里带空格的本地视频：只认确实存在的文件，避免把普通句子当视频
+        return classify_video(value, base_dir)[0] == "local"
+    return _LOCAL_VIDEO_RE.match(token) is not None
+
+
+def bili_embed_src(text):
+    """从 B 站链接 / BV 号还原 player.html 地址（保留 cid 与 p 参数）；非 B 站返回空串。"""
+    value = (text or "").strip().strip("<>\"'")
+    bv = _BILI_BV_RE.search(value)
+    if not bv:
+        return ""
+    bvid = bv.group(0)
+    if "player.bilibili.com" in value and "cid=" in value:
+        return value
+    page_m = re.search(r"[?&]p=(\d+)", value)
+    page = page_m.group(1) if page_m else "1"
+    cid_m = re.search(r"[?&]cid=(\d+)", value)
+    url = "https://player.bilibili.com/player.html?bvid=%s" % bvid
+    if cid_m:
+        url += "&cid=%s" % cid_m.group(1)
+    return url + "&page=%s&autoplay=0&isOutside=true" % page
+
+
+def video_insert_target(path, base_dir=None):
+    """写进 Markdown 的本地视频地址：优先相对文档目录，反斜杠转 /，空格百分号编码。"""
+    target = os.path.abspath(path)
+    base = base_dir or os.getcwd()
+    try:
+        rel = os.path.relpath(target, base)
+    except ValueError:
+        rel = ""
+    if rel and rel != os.pardir and not rel.startswith(".." + os.sep):
+        target = rel
+    return quote(str(target).replace("\\", "/"), safe="/:")
+
+
+def build_video_markup(text, base_dir=None):
+    """把用户给的视频输入（iframe / B 站链接 / BV 号 / 网页 / 本地文件）变成可插入的 HTML。
+
+    识别失败返回空串，由调用方提示。
+    """
+    value = (text or "").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if "<iframe" in lowered:                     # 已是一段 iframe：原样保留，只纠 B 站播放地址
+        src = video_source_of(value)
+        fixed = bili_embed_src(src)
+        if fixed and fixed != src:
+            value = value.replace(src, fixed)
+        return value.strip()
+    if "<video" in lowered:
+        return value.strip()
+    bili = bili_embed_src(value)
+    if bili:
+        return BILI_IFRAME_TPL % bili
+    if lowered.startswith(("http://", "https://")):
+        return BILI_IFRAME_TPL % value
+    kind, payload, _label = classify_video(value, base_dir)
+    if kind == "local":
+        return VIDEO_TAG_TPL % video_insert_target(payload, base_dir)
+    return ""
+
+
+def video_cache_dir():
+    """播放页与 Edge 独立配置目录（exe 同级 video_cache/，不可写时回退 %LOCALAPPDATA%）。"""
+    base = os.path.join(_app_base_dir(), VIDEO_CACHE_DIR)
+    try:
+        os.makedirs(base, exist_ok=True)
+        probe = os.path.join(base, ".probe")
+        with open(probe, "w", encoding="utf-8") as fp:
+            fp.write("ok")
+        os.remove(probe)
+        return base
+    except Exception:
+        fallback = os.path.join(
+            os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+            APP_NAME, VIDEO_CACHE_DIR)
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+def render_video(widget, block, extra_tags=(), video_ctx=None):
+    """把视频引用渲染成一行可点击条目；无法播放时退化为一行提示文字。
+
+    条目字符位置 → 播放目标 的映射记在 video_ctx["paths"]，每次预览刷新重建（同图片）。
+    """
+    tags = tuple(extra_tags) + ("video",)
+    src = video_source_of(block) or (block or "").strip()
+    kind, payload, label = classify_video(src, (video_ctx or {}).get("base_dir"))
+    if kind == "bad":
+        widget.insert("end", "[视频] %s\n" % label,
+                      tuple(extra_tags) + ("imgfail",))
+        return
+    head = {"bili": "▶ B站视频", "web": "▶ 网页播放器", "local": "▶ 本地视频"}[kind]
+    index = widget.index("end-1c")
+    widget.insert("end-1c", "%s · %s\n" % (head, label), tags)
+    if video_ctx is not None:
+        video_ctx.setdefault("paths", {})[index] = (kind, payload, label)
+
+
+def build_player_html(target):
+    """把播放目标包成一张本地播放页：B 站/网页用 iframe，本地视频用 <video>。"""
+    kind, payload, _label = target
+    if kind == "bili":
+        inner = ('<iframe src="%s" title="哔哩哔哩视频播放器" '
+                 'allow="fullscreen; autoplay; encrypted-media; picture-in-picture" '
+                 'allowfullscreen loading="lazy"></iframe>'
+                 % html_escape(payload))
+    elif kind == "web":
+        inner = ('<iframe src="%s" title="网页播放器" '
+                 'allow="fullscreen; autoplay; encrypted-media; picture-in-picture" '
+                 'allowfullscreen loading="lazy"></iframe>' % html_escape(payload))
+    elif kind == "local":
+        inner = '<video controls autoplay src="%s"></video>' % html_escape(file_url(payload))
+    else:
+        return ""
+    return PLAYER_PAGE_TPL % inner
+
+
+def find_edge_exe():
+    """定位系统 Microsoft Edge（Win10/11 自带，作为内嵌播放内核）。找不到返回空串。"""
+    local = os.environ.get("LOCALAPPDATA") or ""
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)",
+                     "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles") or r"C:\Program Files",
+                     "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe") if local else "",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def find_window_by_pid(pid):
+    """按进程号找该进程最大的可见顶层窗口，用于把 Edge 播放窗嵌进本程序。"""
+    import ctypes.wintypes as wt
+    user32 = ctypes.windll.user32
+    hits = []
+
+    def _callback(hwnd, _lparam):
+        owner = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value != pid or not user32.IsWindowVisible(hwnd):
+            return True
+        rect = wt.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        if rect.right - rect.left > 200 and rect.bottom - rect.top > 120:
+            hits.append(hwnd)
+        return True
+
+    callback = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)(_callback)
+    user32.EnumWindows(callback, 0)
+    return hits[0] if hits else 0
+
+
 def plain_inline(text):
     """去掉行内标记，取纯文本（用于标题等场景）。"""
     def _repl(match):
@@ -1016,8 +1314,8 @@ def render_table_block(widget, lines):
     widget.insert("end", "└" + "┴".join(foot) + "┘\n", ("table",))
 
 
-def render_markdown(widget, md_text, image_ctx=None):
-    """Markdown -> Text 控件渲染；image_ctx 用于渲染图片（v1.7.0）。"""
+def render_markdown(widget, md_text, image_ctx=None, video_ctx=None):
+    """Markdown -> Text 控件渲染；image_ctx 渲染图片（v1.7.0），video_ctx 渲染视频（v1.8.0）。"""
     widget.configure(state="normal")
     widget.delete("1.0", "end")
 
@@ -1052,7 +1350,25 @@ def render_markdown(widget, md_text, image_ctx=None):
             widget.insert("end", "\n", ("normal",))
             continue
 
-        # 2. 空行
+        # 2. 视频块（v1.8.0）：以 <iframe / <video 开头的行，向下收集到标签闭合
+        head_line = line.strip().lower()
+        if head_line.startswith(("<iframe", "<video")):
+            block_lines = [line]
+            index += 1
+            while (index < total and len(block_lines) < 60
+                   and not html_block_complete("\n".join(block_lines))):
+                block_lines.append(lines[index])
+                index += 1
+            render_video(widget, "\n".join(block_lines), ("normal",), video_ctx)
+            continue
+
+        # 3. 裸视频地址独立成行：B 站链接 / BV 号 / 本地视频路径
+        if looks_like_video_line(line, (video_ctx or {}).get("base_dir")):
+            render_video(widget, line.strip(), ("normal",), video_ctx)
+            index += 1
+            continue
+
+        # 4. 空行
         if not line.strip():
             widget.insert("end", "\n", ("normal",))
             index += 1
@@ -1783,6 +2099,12 @@ class MdToolApp:
         self._image_cache = {}
         self._image_paths = {}
         self._image_max_width = IMAGE_PREVIEW_MIN_W
+        # 预览视频（v1.8.0）：「视频条目字符位置 -> 播放目标」映射 / 内嵌播放进程与窗口句柄
+        self._video_paths = {}
+        self._video_proc = None
+        self._video_hwnd = None
+        self._video_current = None
+        self._video_deadline = 0.0
         # 最近一次有效选区（起点, 终点, 文本）：按钮点击抢走焦点后选区高亮会消失，
         # 用它兜底，保证"选中文本 + 点按钮"仍能套用模板。
         self._last_selection = None
@@ -1962,6 +2284,7 @@ class MdToolApp:
             ("链接", self.insert_link),
             ("图片链接", self.insert_image),
             ("插入图片", self.insert_image_file),
+            ("插入视频", self.insert_video),
             ("表格", self.insert_table_template),
             ("分割线", self.insert_hr),
         ]
@@ -2074,8 +2397,32 @@ class MdToolApp:
         bind_colors(ttk.Label(right_head, text="所见即所得（编辑区改动后自动刷新）",
                               font=(FONT_CN, 9)),
                     palette, None, "hint_fg").pack(side="left")
+        # 内嵌视频播放面板（v1.8.0）：默认隐藏，点预览里的「▶ 视频」条目才出现。
+        # tkinter 的 Text 放不了 HTML 播放器，所以播放器是嵌在本栏底部的子窗口（Edge 内核）。
+        self.video_title_var = tk.StringVar(value="")
+        self.video_panel = ttk.LabelFrame(right, text=" ▶ 视频播放器 ")
+        video_head = ttk.Frame(self.video_panel)
+        video_head.pack(fill="x", padx=6, pady=(2, 0))
+        ttk.Button(video_head, text="关闭", padding=(6, 1),
+                   command=self._stop_video).pack(side="right")
+        ttk.Button(video_head, text="浏览器打开", padding=(6, 1),
+                   command=self._open_video_in_browser).pack(side="right", padx=(0, 4))
+        bind_colors(ttk.Label(video_head, textvariable=self.video_title_var,
+                              font=(FONT_CN, 9)),
+                    palette, None, "hint_fg").pack(side="left")
+        self.video_host = tk.Frame(self.video_panel, bg="#000000",
+                                   height=VIDEO_PANEL_H)
+        self.video_host.pack(fill="x", padx=6, pady=6)
+        self.video_host.pack_propagate(False)
+        self._video_tip = tk.Label(self.video_host, bg="#000000", fg="#8b949e",
+                                   font=(FONT_CN, 9),
+                                   text="点上方预览里的「▶ 视频」条目开始播放")
+        self._video_tip.pack(expand=True)
+        self.video_host.bind("<Configure>", self._place_video_window, add="+")
+
         r_wrap = ttk.Frame(right)
         r_wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        self._right_wrap = r_wrap
         self.preview = bind_colors(
             tk.Text(r_wrap, wrap="word", relief="solid", borderwidth=1,
                     width=26,
@@ -2097,6 +2444,12 @@ class MdToolApp:
         self.preview.tag_bind("img", "<Enter>",
                               lambda _e: self.preview.configure(cursor="hand2"))
         self.preview.tag_bind("img", "<Leave>",
+                              lambda _e: self.preview.configure(cursor="arrow"))
+        # 预览视频（v1.8.0）：悬停变手型，单击在内嵌播放面板里真播放
+        self.preview.tag_bind("video", "<Button-1>", self._open_preview_video)
+        self.preview.tag_bind("video", "<Enter>",
+                              lambda _e: self.preview.configure(cursor="hand2"))
+        self.preview.tag_bind("video", "<Leave>",
                               lambda _e: self.preview.configure(cursor="arrow"))
         self.preview.bind("<Configure>", self._on_preview_configure, add="+")
 
@@ -2364,6 +2717,10 @@ class MdToolApp:
         if not self.confirm_unsaved("退出"):
             return
         try:
+            self._stop_video(silent=True)      # 结束内嵌视频播放进程（v1.8.0）
+        except Exception:
+            pass
+        try:
             self.save_layout()
         except Exception:
             pass
@@ -2532,6 +2889,8 @@ class MdToolApp:
         self.root.bind("<Control-Shift-c>", lambda e: self.copy_all())
         self.root.bind("<Control-Shift-I>", lambda e: self.insert_image_file())
         self.root.bind("<Control-Shift-i>", lambda e: self.insert_image_file())
+        self.root.bind("<Control-Shift-V>", lambda e: self.insert_video())
+        self.root.bind("<Control-Shift-v>", lambda e: self.insert_video())
         self.root.bind("<F1>", lambda e: self.show_help())
         self.root.bind("<Control-comma>", lambda e: self.open_settings())
         self.root.bind("<Control-,>", lambda e: self.open_settings())
@@ -2561,7 +2920,8 @@ class MdToolApp:
         self.preview_job = None
         try:
             content = self.editor.get("1.0", "end-1c")
-            render_markdown(self.preview, content, self._preview_image_ctx())
+            render_markdown(self.preview, content, self._preview_image_ctx(),
+                            self._preview_video_ctx())
             self.update_stats()
         except Exception as exc:  # 预览出错不影响编辑
             log_action("预览异常", repr(exc))
@@ -2608,6 +2968,230 @@ class MdToolApp:
                                    "无法打开图片：\n%s\n\n%s" % (path, exc),
                                    parent=self.root)
         return "break"
+
+    # ---------------- 预览视频（v1.8.0） ----------------
+    def _preview_video_ctx(self):
+        """视频渲染上下文：基准目录 + 「条目字符位置 → 播放目标」映射（每次刷新重建）。"""
+        base_dir = os.getcwd()
+        if self.current_file:
+            try:
+                base_dir = os.path.dirname(os.path.abspath(self.current_file))
+            except Exception:
+                base_dir = os.getcwd()
+        self._video_paths = {}
+        return {"base_dir": base_dir, "paths": self._video_paths}
+
+    def _open_preview_video(self, event=None):
+        """单击预览里的「▶ 视频」条目：在预览栏底部内嵌面板里真播放。"""
+        if event is None:
+            return "break"
+        try:
+            index = self.preview.index("@%d,%d" % (event.x, event.y))
+        except Exception:
+            return "break"
+        target = self._video_paths.get(index)
+        if not target:
+            return "break"
+        self._play_video(target)
+        return "break"
+
+    def _activate_video_panel(self):
+        """把播放面板挂到预览栏底部（已挂则不动）。"""
+        try:
+            if not self.video_panel.winfo_manager():
+                self.video_panel.pack(side="bottom", fill="x", padx=6,
+                                      pady=(0, 6), before=self._right_wrap)
+        except Exception as exc:
+            log_action("视频面板展开失败", repr(exc))
+
+    def _resize_video_host(self):
+        """播放面板高度贴合 16:9，避免 16:9 内容被压扁（180~420 像素之间）。"""
+        try:
+            width = max(320, int(self._right_wrap.winfo_width()) - 30)
+            height = max(180, min(int(width * 9 / 16.0), 420))
+            self.video_host.configure(height=height)
+        except Exception:
+            pass
+
+    def _play_video(self, target):
+        """按播放目标拉起内嵌播放器；同一目标重复点击不重开进程。"""
+        kind, payload, label = target
+        if self._video_current == target and self._video_proc is not None:
+            self._activate_video_panel()
+            self._place_video_window()
+            return
+        self._stop_video(silent=True)
+        self._video_current = target
+        html = build_player_html(target)
+        if not html:
+            messagebox.showwarning(APP_NAME, "这个视频地址无法播放。", parent=self.root)
+            return
+        self._activate_video_panel()
+        self._resize_video_host()
+        self.root.update_idletasks()
+        self.video_title_var.set("%s · %s" % (
+            {"bili": "B站视频", "web": "网页播放器", "local": "本地视频"}.get(kind, "视频"),
+            label))
+        if self._spawn_video_window(html):
+            self.status_var.set("正在加载视频：%s" % label)
+
+    def _spawn_video_window(self, html):
+        """把播放页写成临时 HTML，用 Edge 应用窗口模式拉起，随后嵌进播放面板。"""
+        edge = find_edge_exe()
+        if not edge:
+            messagebox.showwarning(
+                APP_NAME,
+                "没有找到 Microsoft Edge。\n\n"
+                "内嵌视频播放依赖系统自带 Edge（Chromium 内核），"
+                "也可以点「浏览器打开」用默认浏览器观看。",
+                parent=self.root)
+            return False
+        try:
+            cache_dir = video_cache_dir()
+            page = os.path.join(cache_dir, "player_%s.html"
+                                % hashlib.md5(html.encode("utf-8")).hexdigest()[:12])
+            with open(page, "w", encoding="utf-8") as fp:
+                fp.write(html)
+        except Exception as exc:
+            log_action("视频播放页写入失败", repr(exc))
+            messagebox.showwarning(APP_NAME, "无法创建视频播放页：\n%r" % (exc,),
+                                   parent=self.root)
+            return False
+        try:
+            width = max(360, int(self.video_host.winfo_width()))
+            height = max(240, int(self.video_host.winfo_height()) + 80)
+        except Exception:
+            width, height = 720, 400
+        args = [
+            edge,
+            "--app=%s" % file_url(page),
+            "--user-data-dir=%s" % os.path.join(cache_dir, "edgeprofile"),
+            "--window-size=%d,%d" % (width, height),
+            "--autoplay-policy=no-user-gesture-required",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-features=Translate",
+        ]
+        try:
+            self._video_proc = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as exc:
+            log_action("视频播放器启动失败", repr(exc))
+            self._video_proc = None
+            messagebox.showwarning(APP_NAME, "视频播放器启动失败：\n%r" % (exc,),
+                                   parent=self.root)
+            return False
+        self._video_hwnd = None
+        self._video_deadline = time.time() + VIDEO_EDGE_WAIT_MS / 1000.0
+        self.root.after(VIDEO_WINDOW_POLL_MS, self._watch_video_window)
+        log_action("视频播放", "%s | %s" % (page, edge))
+        return True
+
+    def _watch_video_window(self):
+        """轮询等待 Edge 播放窗口出现，出现后转成面板子窗口。"""
+        if self._video_proc is None:
+            return
+        if self._video_hwnd:
+            self._place_video_window()
+            return
+        hwnd = find_window_by_pid(self._video_proc.pid)
+        if hwnd and self._embed_video_window(hwnd):
+            return
+        if self._video_proc.poll() is not None:
+            self._stop_video(silent=True)
+            self.status_var.set("视频播放器已退出")
+            return
+        if time.time() > self._video_deadline:
+            self.status_var.set("视频加载较慢，可点「浏览器打开」直接观看")
+            self._stop_video(silent=True)
+            return
+        self.root.after(VIDEO_WINDOW_POLL_MS, self._watch_video_window)
+
+    def _embed_video_window(self, hwnd):
+        """把 Edge 顶层窗口改成 WS_CHILD 并挂到播放面板下，(0,0) 铺满。"""
+        user32 = ctypes.windll.user32
+        try:
+            parent = self.video_host.winfo_id()
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            style = (style & ~WIN_DROP_STYLE) | WIN_CHILD_STYLE
+            user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+            user32.SetParent(hwnd, parent)
+            self._video_hwnd = hwnd
+            try:
+                self._video_tip.pack_forget()
+            except Exception:
+                pass
+            self._place_video_window()
+        except Exception as exc:
+            log_action("视频窗口嵌入失败", repr(exc))
+            self._video_hwnd = None
+            return False
+        log_action("视频窗口已嵌入", "hwnd=%s" % hwnd)
+        return True
+
+    def _place_video_window(self, event=None):
+        """播放面板尺寸变化时，让嵌入的播放窗口跟着铺满。"""
+        if not self._video_hwnd:
+            return
+        try:
+            width = max(1, int(self.video_host.winfo_width()))
+            height = max(1, int(self.video_host.winfo_height()))
+            ctypes.windll.user32.MoveWindow(self._video_hwnd, 0, 0,
+                                            width, height, True)
+        except Exception:
+            pass
+
+    def _stop_video(self, silent=False):
+        """停止播放：解除父子关系、结束 Edge 播放进程、收起播放面板。"""
+        hwnd, proc = self._video_hwnd, self._video_proc
+        self._video_hwnd = None
+        self._video_proc = None
+        self._video_current = None
+        if hwnd:
+            try:
+                ctypes.windll.user32.SetParent(hwnd, 0)
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            self.video_panel.pack_forget()
+        except Exception:
+            pass
+        try:
+            self._video_tip.pack(expand=True)
+        except Exception:
+            pass
+        if not silent:
+            self.status_var.set("已关闭视频播放器")
+
+    def _open_video_in_browser(self):
+        """当前视频改用系统默认浏览器观看（内嵌播放的兜底出口）。"""
+        target = self._video_current
+        if not target:
+            messagebox.showinfo(APP_NAME, "还没有在预览里选择视频。", parent=self.root)
+            return
+        kind, payload, label = target
+        if kind == "bili":
+            url = payload if payload.startswith("http") else BILI_PLAYER_URL % payload
+        elif kind == "web":
+            url = payload
+        else:
+            url = file_url(payload)
+        try:
+            webbrowser.open(url)
+            self.status_var.set("已在浏览器打开：%s" % label)
+        except Exception as exc:
+            log_action("浏览器打开视频失败", "%s | %r" % (url, exc))
+            messagebox.showwarning(APP_NAME, "无法打开浏览器：\n%r" % (exc,),
+                                   parent=self.root)
 
     def _on_preview_configure(self, event=None):
         """预览区宽度变化超过 60px 时重排图片（图片按当前宽度等比缩放）。"""
@@ -2853,6 +3437,70 @@ class MdToolApp:
         self._editor_insert("![%s](%s)" % (alt, target))
         log_action("语法插入", "插入本地图片 %s" % path)
         self.status_var.set("已插入图片：%s" % os.path.basename(path))
+
+    def insert_video(self):
+        """插入视频（v1.8.0）：剪贴板里的 iframe/B 站链接直接采纳，否则弹框输入。
+
+        支持：完整 <iframe>/<video> 片段、B 站播放页或视频链接、BV 号、
+        任意 http(s) 网页播放器地址、本地视频文件路径。
+        """
+        base_dir = ""
+        if self.current_file:
+            try:
+                base_dir = os.path.dirname(os.path.abspath(self.current_file))
+            except Exception:
+                base_dir = ""
+        clip = ""
+        try:
+            clip = self.root.clipboard_get()
+        except Exception:
+            clip = ""
+        clip_markup = build_video_markup(clip, base_dir) if clip.strip() else ""
+        markup = ""
+        if clip_markup:
+            markup = clip_markup
+            log_action("语法插入", "插入视频（取自剪贴板）")
+        else:
+            hint = ("粘贴 B 站视频链接 / BV 号 / iframe 代码 / 网页地址：\n"
+                    "（留空则改为选择本地视频文件）")
+            value = simpledialog.askstring("插入视频", hint, parent=self.root)
+            if value is None:
+                log_action("语法插入", "插入视频（已取消）")
+                return
+            value = value.strip()
+            if value:
+                markup = build_video_markup(value, base_dir)
+                if not markup:
+                    messagebox.showwarning(
+                        APP_NAME,
+                        "没能识别这段视频地址。\n\n"
+                        "可以粘贴完整 iframe、B 站播放页/视频链接、BV 号，"
+                        "或 http(s) 网页播放器地址。",
+                        parent=self.root)
+                    return
+            else:
+                path = filedialog.askopenfilename(
+                    parent=self.root, title="选择要插入的视频",
+                    initialdir=base_dir or os.getcwd(),
+                    filetypes=[("视频文件",
+                                " ".join("*" + ext for ext in VIDEO_EXTENSIONS)),
+                               ("所有文件", "*.*")])
+                if not path:
+                    log_action("语法插入", "插入本地视频（已取消）")
+                    return
+                markup = build_video_markup(path, base_dir)
+                if not markup:
+                    messagebox.showwarning(APP_NAME, "无法生成视频标记，请检查文件。",
+                                           parent=self.root)
+                    return
+        sel = self._editor_selection()
+        if sel:
+            start, end, _selected = sel
+            self._replace_range(start, end, markup)
+        else:
+            self._editor_insert(markup)
+        log_action("语法插入", "插入视频 %.60s" % markup.replace("\n", " "))
+        self.status_var.set("已插入视频，点预览里的「▶ 视频」即可播放")
 
     def insert_table_template(self):
         sel = self._editor_selection()

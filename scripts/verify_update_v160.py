@@ -39,7 +39,8 @@ def main():
     mod = load_module()
 
     # 1. 常量
-    check("APP_VERSION == 1.6.0", mod.APP_VERSION == "1.6.0", mod.APP_VERSION)
+    _ver = tuple(int(x) for x in mod.APP_VERSION.split("."))
+    check("APP_VERSION >= 1.6.0", _ver >= (1, 6, 0), mod.APP_VERSION)
     check("UPDATE_REPO 指向开源仓库", mod.UPDATE_REPO == "yangshuang9889/MdCmdTool",
           mod.UPDATE_REPO)
     check("latest 接口地址正确",
@@ -118,7 +119,22 @@ def main():
     check("设置窗口含自动检查开关", '启动时自动检查更新' in text)
     check("网络请求在子线程执行", 'name="UpdateCheck"' in text)
     check("结果回到主线程 via root.after", 'self.root.after(0, lambda: self._on_update_result' in text)
-    check("不自动下载安装", "subprocess" not in text and "os.system" not in text)
+    # 视频功能（v1.8.0）会拉起 Edge 播放器，因此不再禁止全局 subprocess，
+    # 改为限定「更新链路内不出现任何下载 / 安装 / 自替换动作」
+    _lines = text.splitlines()
+    _start = next(k for k, ln in enumerate(_lines)
+                  if ln.startswith("def fetch_latest_release"))
+    _end = len(_lines)
+    for _k in range(_start + 1, len(_lines)):
+        if _lines[_k].startswith("def ") or _lines[_k].startswith("class "):
+            _end = _k
+            break
+    _update_block = "\n".join(_lines[_start:_end])
+    check("更新链路不自动下载安装",
+          "urlretrieve" not in text
+          and "subprocess" not in _update_block
+          and "os.system" not in _update_block
+          and "Popen" not in _update_block)
 
     passed = sum(1 for _, ok, _ in results if ok)
     print("\n合计 %d/%d PASS" % (passed, len(results)))

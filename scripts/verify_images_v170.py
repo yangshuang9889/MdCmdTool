@@ -9,6 +9,7 @@
 5. 界面静态约束：版本号、工具栏按钮、快捷键、预览 tag_bind
 """
 import importlib.util
+import re
 import os
 import sys
 import tempfile
@@ -140,12 +141,17 @@ def main():
     # ---------------- 5. 静态约束 ----------------
     with open(SRC, encoding="utf-8-sig") as fp:
         source = fp.read()
-    check("静态：版本 1.7.0", 'APP_VERSION = "1.7.0"' in source)
+    ver = re.search(r'APP_VERSION = "([\d.]+)"', source)
+    check("静态：版本不低于 1.7.0",
+          bool(ver) and tuple(int(x) for x in ver.group(1).split(".")) >= (1, 7, 0),
+          ver.group(1) if ver else "未找到")
     check("静态：工具栏按钮", '("插入图片", self.insert_image_file)' in source)
     check("静态：快捷键", '"<Control-Shift-I>"' in source)
     check("静态：预览点击打开", 'tag_bind("img", "<Button-1>", self._open_preview_image)' in source)
     check("静态：渲染透传上下文",
-          "render_markdown(self.preview, content, self._preview_image_ctx())" in source)
+          "self._preview_image_ctx()" in source
+          and re.search(r"render_markdown\(self\.preview, content,\s*self\._preview_image_ctx\(\)",
+                        source) is not None)
     check("静态：Pillow 可选", "_PIL_OK" in source and "except Exception:  # pragma: no cover" in source)
     check("静态：JPG 在扩展名表", '".jpg"' in source and "IMAGE_EXTENSIONS" in source)
 

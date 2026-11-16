@@ -1,8 +1,8 @@
 ﻿# UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 6, 0, 0),
-    prodvers=(1, 6, 0, 0),
+    filevers=(1, 8, 0, 0),
+    prodvers=(1, 8, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', '杨爽工作室'),
             StringStruct('FileDescription', '爽哥MD编辑工具'),
-            StringStruct('FileVersion', '1.7.0.0'),
+            StringStruct('FileVersion', '1.8.0.0'),
             StringStruct('InternalName', 'SgMdEditor'),
             StringStruct('LegalCopyright', 'Copyright (C) 2026 杨爽'),
             StringStruct('OriginalFilename', '爽哥MD编辑工具.exe'),
             StringStruct('ProductName', '爽哥MD编辑工具'),
-            StringStruct('ProductVersion', '1.7.0.0')
+            StringStruct('ProductVersion', '1.8.0.0')
           ]
         )
       ]

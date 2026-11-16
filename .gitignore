@@ -29,3 +29,6 @@ archives/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 视频播放临时缓存（含 Edge 独立配置目录，运行时生成）
+video_cache/
