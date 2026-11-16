@@ -61,7 +61,7 @@ except Exception:  # pragma: no cover
 # 常量信息
 # ---------------------------------------------------------------------------
 APP_NAME = "爽哥MD编辑工具"
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.9.0"
 AUTHOR = "杨爽"
 AI_TOOL = "Marvis"
 EMAIL = "675680672@qq.com"
@@ -319,6 +319,300 @@ def style_menu(menu, palette):
     except Exception:
         pass
     return menu
+
+
+# ---------------- 中文右键菜单（v1.9.0） ----------------
+# tkinter 的 Text / Entry 在 Windows 上不提供可用的中文右键菜单，用户只能靠快捷键。
+# 这里给每个输入控件挂一套统一的中文右键菜单：
+#   撤销 / 重做 / 剪切 / 复制 / 粘贴 / 删除 / 全选，按场景置灰；
+#   只读控件（实时预览、更新说明）只保留「复制 / 全选」，避免点了没反应。
+
+CTX_EDIT_ITEMS = ("undo", "redo", "sep", "cut", "copy", "paste", "delete",
+                  "sep", "select")
+CTX_READONLY_ITEMS = ("copy", "sep", "select")
+
+CTX_ITEM_LABELS = {
+    "undo": ("撤销", "Ctrl+Z"),
+    "redo": ("重做", "Ctrl+Y"),
+    "cut": ("剪切", "Ctrl+X"),
+    "copy": ("复制", "Ctrl+C"),
+    "paste": ("粘贴", "Ctrl+V"),
+    "delete": ("删除", "Del"),
+    "select": ("全选", "Ctrl+A"),
+}
+
+
+def _widget_is_entry(widget):
+    """Entry / ttk.Entry 的选区索引（sel.first）与 Text 不同，需分开处理。"""
+    try:
+        return widget.winfo_class() in ("Entry", "TEntry")
+    except Exception:
+        return False
+
+
+def _edit_flag(widget, name):
+    """读 Text/Entry 的 edit canundo / canredo 标志，控件不支持时返回 False。"""
+    try:
+        return bool(int(widget.tk.call(widget._w, "edit", name)))
+    except Exception:
+        return False
+
+
+class TextContextMenu:
+    """给单个文本类控件挂中文右键菜单（Text / Entry 通用）。
+
+    editable=False 表示只读控件：只保留「复制 / 全选」。
+    on_changed 在每次菜单动作后回调，主编辑区用它刷新预览与统计。
+    """
+
+    def __init__(self, widget, palette_getter=None, editable=True,
+                 on_changed=None):
+        self.widget = widget
+        self._palette_getter = palette_getter
+        self.editable = bool(editable)
+        self.on_changed = on_changed
+        self.menu = tk.Menu(widget, tearoff=0)
+        self._index = {}
+        self._build()
+        self.restyle()
+        widget.bind("<Button-3>", self.popup, add="+")
+        widget.bind("<Shift-F10>", self.popup, add="+")
+
+    # ---------------- 构建与配色 ----------------
+    def _build(self):
+        menu = self.menu
+        menu.delete(0, "end")
+        self._index = {}
+        items = CTX_EDIT_ITEMS if self.editable else CTX_READONLY_ITEMS
+        for key in items:
+            if key == "sep":
+                menu.add_separator()
+                continue
+            label, accel = CTX_ITEM_LABELS[key]
+            menu.add_command(label=label, accelerator=accel,
+                             command=lambda k=key: self.fire(k))
+            self._index[key] = menu.index("end")
+
+    def restyle(self, palette=None):
+        """主题切换后重新上色（与菜单栏同一套配色）。"""
+        if palette is None and self._palette_getter is not None:
+            try:
+                palette = self._palette_getter()
+            except Exception:
+                palette = None
+        if palette:
+            style_menu(self.menu, palette)
+        return self.menu
+
+    def labels(self):
+        """当前菜单可见项（测试用）：返回 label 列表，分隔线记为 None。"""
+        out = []
+        try:
+            last = self.menu.index("end")
+        except Exception:
+            return out
+        if last is None:
+            return out
+        for i in range(last + 1):
+            try:
+                if self.menu.type(i) == "separator":
+                    out.append(None)
+                else:
+                    out.append(self.menu.entrycget(i, "label"))
+            except Exception:
+                out.append(None)
+        return out
+
+    # ---------------- 状态探测 ----------------
+    def has_selection(self):
+        widget = self.widget
+        try:
+            if _widget_is_entry(widget):
+                return bool(widget.selection_present())
+            return bool(widget.tag_ranges("sel"))
+        except Exception:
+            return False
+
+    def selection_text(self):
+        widget = self.widget
+        try:
+            if _widget_is_entry(widget):
+                return widget.selection_get() if widget.selection_present() else None
+            return widget.get("sel.first", "sel.last")
+        except Exception:
+            return None
+
+    def has_content(self):
+        widget = self.widget
+        try:
+            if _widget_is_entry(widget):
+                return bool(widget.get())
+            return bool(widget.get("1.0", "end-1c"))
+        except Exception:
+            return False
+
+    def _clipboard_has_text(self):
+        try:
+            return bool(self.widget.clipboard_get())
+        except Exception:
+            return False
+
+    def refresh_state(self):
+        """按选区 / 剪贴板 / 撤销栈决定各项可点性，返回 {item: bool}。"""
+        if not self._index:
+            self._build()
+        states = {
+            "undo": _edit_flag(self.widget, "canundo"),
+            "redo": _edit_flag(self.widget, "canredo"),
+            "cut": self.has_selection(),
+            "copy": self.has_selection(),
+            "paste": self._clipboard_has_text(),
+            "delete": self.has_selection(),
+            "select": self.has_content(),
+        }
+        for key, idx in self._index.items():
+            enabled = bool(states.get(key))
+            try:
+                self.menu.entryconfigure(
+                    idx, state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+        return states
+
+    # ---------------- 动作 ----------------
+    def fire(self, key):
+        handler = {
+            "undo": self._undo,
+            "redo": self._redo,
+            "cut": self._cut,
+            "copy": self._copy,
+            "paste": self._paste,
+            "delete": self._delete,
+            "select": self._select_all,
+        }.get(key)
+        done = False
+        if handler is not None:
+            try:
+                done = bool(handler())
+            except Exception:
+                done = False
+        self._notify()
+        return done
+
+    def _notify(self):
+        if self.on_changed is not None:
+            try:
+                self.on_changed()
+            except Exception:
+                pass
+
+    def _undo(self):
+        if _edit_flag(self.widget, "canundo"):
+            self.widget.event_generate("<<Undo>>")
+            return True
+        return False
+
+    def _redo(self):
+        if _edit_flag(self.widget, "canredo"):
+            self.widget.event_generate("<<Redo>>")
+            return True
+        return False
+
+    def _write_clipboard(self, text):
+        if not text:
+            return False
+        try:
+            self.widget.clipboard_clear()
+            self.widget.clipboard_append(text)
+            return True
+        except Exception:
+            return False
+
+    def _copy(self):
+        data = self.selection_text()
+        if not data:
+            return False
+        return self._write_clipboard(data)
+
+    def _cut(self):
+        if not self.editable:
+            return False
+        data = self.selection_text()
+        if not data:
+            return False
+        self._write_clipboard(data)
+        try:
+            self.widget.delete("sel.first", "sel.last")
+        except Exception:
+            return False
+        return True
+
+    def _delete(self):
+        if not self.editable or not self.has_selection():
+            return False
+        try:
+            self.widget.delete("sel.first", "sel.last")
+        except Exception:
+            return False
+        return True
+
+    def _paste(self):
+        if not self.editable:
+            return False
+        try:
+            data = self.widget.clipboard_get()
+        except Exception:
+            return False
+        if not data:
+            return False
+        try:
+            if self.has_selection():
+                self.widget.delete("sel.first", "sel.last")
+            self.widget.insert("insert", data)
+        except Exception:
+            return False
+        return True
+
+    def _select_all(self):
+        widget = self.widget
+        try:
+            if _widget_is_entry(widget):
+                widget.selection_range(0, "end")
+                widget.icursor("end")
+                return True
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "1.0")
+            widget.see("insert")
+        except Exception:
+            return False
+        return True
+
+    # ---------------- 弹出 ----------------
+    def popup(self, event=None):
+        try:
+            self.widget.focus_set()
+        except Exception:
+            pass
+        self.refresh_state()
+        try:
+            x = event.x_root if event is not None else self.widget.winfo_rootx()
+            y = event.y_root if event is not None else self.widget.winfo_rooty()
+            self.menu.tk_popup(x, y)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+
+def install_text_context_menu(widget, palette_getter=None, editable=True,
+                              on_changed=None):
+    """给任意文本类控件（Text / Entry）挂中文右键菜单，返回控制器。"""
+    return TextContextMenu(widget, palette_getter=palette_getter,
+                           editable=editable, on_changed=on_changed)
 
 
 def apply_palette(tree, palette):
@@ -1707,6 +2001,9 @@ class UpdateDialog(tk.Toplevel):
                 content = "当前已是最新版本，无需更新。"
         notes_text.insert("1.0", content)
         notes_text.configure(state="disabled")
+        # 只读说明文本：给「复制 / 全选」，方便用户拷走更新说明
+        install_text_context_menu(notes_text, palette_getter=lambda p=palette: p,
+                                  editable=False)
 
         buttons = tk.Frame(self, bg=palette["panel_bg"])
         buttons.pack(fill="x", padx=18, pady=(0, 16))
@@ -2129,6 +2426,8 @@ class MdToolApp:
         self._base_content = ""
         self.preview_job = None
         self.buttons = {}
+        # 中文右键菜单（v1.9.0）：三个输入区的 TextContextMenu 控制器，主题切换时统一重上色
+        self._context_menus = []
         # 预览图片（v1.7.0）：解码缓存 / 「图片字符位置 -> 本地路径」映射 / 当前可用宽度
         self._image_cache = {}
         self._image_paths = {}
@@ -2268,6 +2567,23 @@ class MdToolApp:
         self.buttons[text] = btn
         return btn
 
+    def _attach_context_menu(self, widget, editable=True, on_changed=None):
+        """给输入控件挂中文右键菜单（v1.9.0），并登记以便主题切换时重上色。"""
+        menu = install_text_context_menu(
+            widget, palette_getter=lambda: self.palette,
+            editable=editable, on_changed=on_changed)
+        self._context_menus.append(menu)
+        return menu
+
+    def _after_context_edit(self):
+        """右键菜单改过编辑器内容后立即同步脏标记、预览与统计。"""
+        try:
+            self._sync_dirty_state()
+        except Exception:
+            pass
+        self.schedule_preview()
+        self.update_stats()
+
     def _build_toolbar(self):
         palette = self.palette
         bar = bind_colors(tk.Frame(self.root, bg=palette["toolbar_bg"]),
@@ -2373,6 +2689,7 @@ class MdToolApp:
         self.cmd_text.configure(yscrollcommand=cmd_scroll.set)
         self.cmd_text.pack(side="left", fill="both", expand=True)
         cmd_scroll.pack(side="right", fill="y")
+        self._attach_context_menu(self.cmd_text, editable=True)
 
         for text, command in [
             ("生成表格", lambda: self.generate_from_commands("table")),
@@ -2421,6 +2738,8 @@ class MdToolApp:
         self.editor.bind("<Button-1>", self._on_editor_click, add="+")
         self.editor.bind("<ButtonRelease-1>", self._remember_selection, add="+")
         self.editor.bind("<<Selection>>", self._remember_selection, add="+")
+        self._attach_context_menu(self.editor, editable=True,
+                                  on_changed=self._after_context_edit)
 
         # 右：实时预览
         right = ttk.LabelFrame(paned, text=" ③ 实时预览 ")
@@ -2486,6 +2805,8 @@ class MdToolApp:
         self.preview.tag_bind("video", "<Leave>",
                               lambda _e: self.preview.configure(cursor="arrow"))
         self.preview.bind("<Configure>", self._on_preview_configure, add="+")
+        # 只读控件：只给「复制 / 全选」，其余动作置灰不出现
+        self._attach_context_menu(self.preview, editable=False)
 
         self._panel_widgets = {"left": left, "middle": middle, "right": right}
         self._apply_panel_state(initial=True)
@@ -2509,6 +2830,8 @@ class MdToolApp:
         apply_palette(self.root, self.palette)
         for menu in getattr(self, "_menus", []) or []:
             style_menu(menu, self.palette)
+        for ctx in getattr(self, "_context_menus", []) or []:
+            ctx.restyle(self.palette)
         self._restyle_texts()
         self._restyle_windows()
         self.refresh_preview()
@@ -3567,6 +3890,7 @@ class MdToolApp:
         box = tk.Text(body, width=76, height=8, wrap="char", undo=True,
                       font=(FONT_MONO, 10))
         box.pack(fill="both", expand=True, pady=(8, 6))
+        self._attach_context_menu(box, editable=True)
         if initial:
             box.insert("1.0", initial)
         ttk.Label(body, text="Ctrl+Enter 确定 · Esc 取消",

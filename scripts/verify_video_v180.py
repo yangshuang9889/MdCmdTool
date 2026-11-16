@@ -52,7 +52,10 @@ def main():
         fp.write(b"\x00" * 64)
 
     # ---------- A. 常量契约 ----------
-    eq("A1 APP_VERSION 升到 1.8.0", m.APP_VERSION, "1.8.0")
+    # v1.9.0 起版本号随迭代前移，此处只校验「不低于 1.8.0」，避免版本推进后误报
+    check("A1 APP_VERSION 不低于 1.8.0",
+          tuple(int(x) for x in m.APP_VERSION.split(".")[:3]) >= (1, 8, 0),
+          m.APP_VERSION)
     check("A2 VIDEO_EXTENSIONS 覆盖 mp4/webm/mkv",
           {".mp4", ".webm", ".mkv"} <= set(m.VIDEO_EXTENSIONS), m.VIDEO_EXTENSIONS)
     check("A3 VIDEO_PANEL_H 为合理正整数",

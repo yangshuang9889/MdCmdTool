@@ -1,8 +1,37 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: b39d940f30a0c1cf547a23c927f28498_409e77bee18b11f1a768525400cd780f
+    ReservedCode1: IxzQRiTMxO4FaP6z6eCD3PgqUBBJLHtdLnTgAVSbvDuU8CpK6oW1r09M5WYHWkPRJWGX6atvdiSndFU5yjHliW+vJLg7kX7nL90hNopjEszZOnuqZkFyeeRUO7ov9bfXRvNk6c9wTekxJDk0s8SaXFUDFb5CcXN3L7fDVmZzKTwXNyASbLipHPy+eko=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: b39d940f30a0c1cf547a23c927f28498_409e77bee18b11f1a768525400cd780f
+    ReservedCode2: IxzQRiTMxO4FaP6z6eCD3PgqUBBJLHtdLnTgAVSbvDuU8CpK6oW1r09M5WYHWkPRJWGX6atvdiSndFU5yjHliW+vJLg7kX7nL90hNopjEszZOnuqZkFyeeRUO7ov9bfXRvNk6c9wTekxJDk0s8SaXFUDFb5CcXN3L7fDVmZzKTwXNyASbLipHPy+eko=
+---
+
 ﻿# 更新日志
 
 本项目遵循语义化版本（`主版本.次版本.修订号`）。每个版本对应的可执行文件见 [Releases](https://github.com/yangshuang9889/MdCmdTool/releases)。
 
 > 提示：程序内「帮助 → 检查更新」读取的正是这里的 Release 版本号与说明，发版时请同步创建 Release 并填写更新内容。
+
+## v1.9.0（2026-11-16）
+**新增：输入框全中文右键菜单**
+- 三个输入区——左栏「① 命令速查录入」、中栏「② Markdown 编辑器」、右栏「③ 实时预览」——右键即可弹出中文菜单，不再落到 tkinter 的英文默认菜单或干脆没反应。
+- 可编辑区菜单项：撤销 / 重做 / 剪切 / 复制 / 粘贴 / 删除 / 全选（带 `Ctrl+Z` / `Ctrl+Y` / `Ctrl+X` / `Ctrl+C` / `Ctrl+V` / `Del` / `Ctrl+A` 快捷键提示）。
+- 置灰规则按场景实时计算（每次弹出前重算，不用先点一下才准）：
+  - 撤销 / 重做 → 看该控件的撤销栈是否可用（`edit canundo` / `edit canredo`）；
+  - 剪切 / 复制 / 删除 → 只有存在选区才亮；
+  - 粘贴 → 剪贴板里确实有文本才亮；
+  - 全选 → 控件里有内容才亮。
+- 只读控件（实时预览、更新弹窗里的说明文本）只保留「复制 / 全选」，剪切 / 粘贴 / 删除 / 撤销直接不出现在菜单里，避免点了没反应。
+- 菜单跟随主题：浅色 / 深色切换时背景、前景、高亮色与主菜单栏保持同一套配色。
+- 通过右键菜单改动编辑器内容后，脏标记、预览、字数统计立即刷新，与手动输入一致。
+- 其他输入位置同步覆盖：插入视频的多行输入框（`_ask_video_text`）、更新弹窗的说明文本（`UpdateDialog`）；`tk.Entry` / `ttk.Entry` 类控件同样通用。
+- 回归：新增 `scripts/verify_context_v190.py` 60 / 60 PASS；`verify_video_v181.py` 23 / 23、`verify_images_v170.py` 34 / 34、`verify_unsaved_v150.py` 25 / 25、`verify_update_v160.py` 28 / 28、`verify_video_v180.py` 62 / 62 全绿；开发手册行号校验引用 302 条（通过 266 / 失败 0 / 非符号 36 条已逐条登记）、越界 0。
+- 回归脚本维护：`scripts/verify_video_v180.py` 中「`APP_VERSION` 必须等于 `1.8.0`」的版本锁定断言改为「不低于 `1.8.0`」，避免后续版本推进后误报。
+- 版本号同步：`APP_VERSION` → `1.9.0`、`version_info.txt` → `1.9.0.0`。
+- 产物：`dist\SgMdEditor-v1.9.0.exe`（30,949,625 字节，FileVersion / ProductVersion 均为 `1.9.0.0`，冒烟启动标题显示 `爽哥MD编辑工具 v1.9.0`）。
 
 ## v1.8.1（2026-11-16）
 
@@ -135,3 +164,4 @@
 ## v1.0.0
 
 - 首版：命令速查转表（表格 / 代码清单 / 列表）、Markdown 编辑、实时预览、导出 `.md`、一键复制、日志与异常兜底。
+*（内容由AI生成，仅供参考）*
