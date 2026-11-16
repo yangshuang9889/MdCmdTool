@@ -61,7 +61,7 @@ except Exception:  # pragma: no cover
 # 常量信息
 # ---------------------------------------------------------------------------
 APP_NAME = "爽哥MD编辑工具"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 AUTHOR = "杨爽"
 AI_TOOL = "Marvis"
 EMAIL = "675680672@qq.com"
@@ -1082,28 +1082,62 @@ def video_insert_target(path, base_dir=None):
     return quote(str(target).replace("\\", "/"), safe="/:")
 
 
+_TAG_HEAD_RE = re.compile(r"^<\s*(?:iframe|video)\b", re.I)
+
+
+def video_markup_pure(value):
+    """整段输入是否只由一段 iframe / video 标记构成（前后不夹带其它正文）。"""
+    text = (value or "").strip()
+    if not text or len(text) > 4000:
+        return False
+    if not _TAG_HEAD_RE.match(text):
+        return False
+    if not html_block_complete(text):
+        return False
+    if re.search(r"</\s*(?:iframe|video)\s*>\s*$", text, re.I):
+        return True
+    return re.search(r"/\s*>\s*$", text) is not None
+
+
+def url_like(value):
+    """整段输入是否只是一个网址（无空白、无多余文字）。"""
+    text = (value or "").strip()
+    if not text or len(text) > 2048:
+        return False
+    if any(ch.isspace() for ch in text):
+        return False
+    return re.match(r"^https?://[^\s/]+\.[^\s/?]+", text, re.I) is not None
+
+
 def build_video_markup(text, base_dir=None):
     """把用户给的视频输入（iframe / B 站链接 / BV 号 / 网页 / 本地文件）变成可插入的 HTML。
 
-    识别失败返回空串，由调用方提示。
+    v1.8.1 修复：只接受"整段就是一个视频标记 / 地址"的输入。夹带正文的（剪贴板里
+    常常是聊天记录或文档文字）一律判为识别失败返回空串，交给调用方提示用户，
+    避免把一大段无关文字当成 iframe 插进文档。
     """
     value = (text or "").strip()
     if not value:
         return ""
     lowered = value.lower()
-    if "<iframe" in lowered:                     # 已是一段 iframe：原样保留，只纠 B 站播放地址
+    if "<iframe" in lowered:
+        if not video_markup_pure(value):
+            return ""
         src = video_source_of(value)
+        if not src:
+            return ""
         fixed = bili_embed_src(src)
         if fixed and fixed != src:
             value = value.replace(src, fixed)
         return value.strip()
     if "<video" in lowered:
+        if not video_markup_pure(value) or not video_source_of(value):
+            return ""
         return value.strip()
-    bili = bili_embed_src(value)
-    if bili:
-        return BILI_IFRAME_TPL % bili
-    if lowered.startswith(("http://", "https://")):
-        return BILI_IFRAME_TPL % value
+    if _BILI_BV_RE.fullmatch(value):
+        return BILI_IFRAME_TPL % bili_embed_src(value)
+    if url_like(value):
+        return BILI_IFRAME_TPL % (bili_embed_src(value) or value)
     kind, payload, _label = classify_video(value, base_dir)
     if kind == "local":
         return VIDEO_TAG_TPL % video_insert_target(payload, base_dir)
@@ -3439,10 +3473,10 @@ class MdToolApp:
         self.status_var.set("已插入图片：%s" % os.path.basename(path))
 
     def insert_video(self):
-        """插入视频（v1.8.0）：剪贴板里的 iframe/B 站链接直接采纳，否则弹框输入。
+        """插入视频（v1.8.1）：剪贴板里是干净的视频内容才直接采纳，否则弹多行输入框。
 
-        支持：完整 <iframe>/<video> 片段、B 站播放页或视频链接、BV 号、
-        任意 http(s) 网页播放器地址、本地视频文件路径。
+        修复要点：以前剪贴板里只要沾到 "<iframe" / "http" 就被整段原样插进文档，
+        用户复制的聊天或文档文字会被当成视频插进来（表现为"插入视频不好使"）。
         """
         base_dir = ""
         if self.current_file:
@@ -3452,18 +3486,23 @@ class MdToolApp:
                 base_dir = ""
         clip = ""
         try:
-            clip = self.root.clipboard_get()
+            clip = (self.root.clipboard_get() or "").strip()
         except Exception:
             clip = ""
-        clip_markup = build_video_markup(clip, base_dir) if clip.strip() else ""
         markup = ""
-        if clip_markup:
-            markup = clip_markup
-            log_action("语法插入", "插入视频（取自剪贴板）")
-        else:
-            hint = ("粘贴 B 站视频链接 / BV 号 / iframe 代码 / 网页地址：\n"
-                    "（留空则改为选择本地视频文件）")
-            value = simpledialog.askstring("插入视频", hint, parent=self.root)
+        source = ""
+        if clip:
+            markup = build_video_markup(clip, base_dir)
+            if markup:
+                source = "剪贴板"
+        if not markup:
+            initial = ""
+            low_clip = clip.lower()
+            if clip and ("<iframe" in low_clip or "<video" in low_clip
+                         or "http://" in low_clip or "https://" in low_clip):
+                initial = clip[:2000]
+            value = self._ask_video_text(initial=initial,
+                                         clip_rejected=bool(clip))
             if value is None:
                 log_action("语法插入", "插入视频（已取消）")
                 return
@@ -3474,10 +3513,12 @@ class MdToolApp:
                     messagebox.showwarning(
                         APP_NAME,
                         "没能识别这段视频地址。\n\n"
-                        "可以粘贴完整 iframe、B 站播放页/视频链接、BV 号，"
-                        "或 http(s) 网页播放器地址。",
+                        "只支持：完整 iframe / <video> 标记、B 站播放页或视频链接、"
+                        "BV 号、网页播放器地址、本地视频文件。\n"
+                        "如果粘贴的内容里夹带了别的话，请只保留视频标记或链接。",
                         parent=self.root)
                     return
+                source = "手动输入"
             else:
                 path = filedialog.askopenfilename(
                     parent=self.root, title="选择要插入的视频",
@@ -3493,14 +3534,81 @@ class MdToolApp:
                     messagebox.showwarning(APP_NAME, "无法生成视频标记，请检查文件。",
                                            parent=self.root)
                     return
-        sel = self._editor_selection()
-        if sel:
-            start, end, _selected = sel
-            self._replace_range(start, end, markup)
+                source = "本地文件"
+        ranges = self.editor.tag_ranges("sel")
+        if ranges:
+            self._replace_range(ranges[0], ranges[1], markup,
+                                caret_offset=len(markup))
         else:
             self._editor_insert(markup)
-        log_action("语法插入", "插入视频 %.60s" % markup.replace("\n", " "))
-        self.status_var.set("已插入视频，点预览里的「▶ 视频」即可播放")
+            self.editor.see("insert")
+        log_action("语法插入", "插入视频（%s）%.60s"
+                   % (source, markup.replace("\n", " ")))
+        self.status_var.set("已插入视频（来源：%s），点预览里的「▶」即可播放" % source)
+
+    def _ask_video_text(self, initial="", clip_rejected=False):
+        """多行"插入视频"输入框：粘贴多行 iframe 不会被单行框挤成一行。
+
+        返回输入的文本；取消返回 None；点「选择本地视频」或留空确定返回空串。
+        """
+        result = {"value": None}
+        win = tk.Toplevel(self.root)
+        win.title("插入视频")
+        win.transient(self.root)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=("粘贴 B 站视频链接 / BV 号 / iframe 代码 / 网页地址：\n"
+                              "（留空则改为选择本地视频文件）"),
+                  justify="left", font=(FONT_CN, 10)).pack(anchor="w")
+        if clip_rejected:
+            ttk.Label(body, text="剪贴板内容不是可识别的视频，已忽略。",
+                      justify="left", font=(FONT_CN, 9),
+                      foreground="#b26a00").pack(anchor="w", pady=(3, 0))
+        box = tk.Text(body, width=76, height=8, wrap="char", undo=True,
+                      font=(FONT_MONO, 10))
+        box.pack(fill="both", expand=True, pady=(8, 6))
+        if initial:
+            box.insert("1.0", initial)
+        ttk.Label(body, text="Ctrl+Enter 确定 · Esc 取消",
+                  font=(FONT_CN, 9), foreground="#777777").pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(8, 0))
+
+        def _ok(event=None):
+            result["value"] = box.get("1.0", "end-1c")
+            win.destroy()
+            return "break"
+
+        def _cancel(event=None):
+            result["value"] = None
+            win.destroy()
+            return "break"
+
+        def _pick_file():
+            result["value"] = ""
+            win.destroy()
+
+        ttk.Button(row, text="确定", command=_ok, padding=(14, 3)).pack(side="right")
+        ttk.Button(row, text="取消", command=_cancel,
+                   padding=(14, 3)).pack(side="right", padx=(0, 6))
+        ttk.Button(row, text="选择本地视频…", command=_pick_file,
+                   padding=(14, 3)).pack(side="left")
+        box.bind("<Control-Return>", _ok)
+        box.bind("<Escape>", _cancel)
+        win.bind("<Escape>", _cancel)
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+            win.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        except Exception:
+            pass
+        box.focus_set()
+        box.mark_set("insert", "end-1c")
+        win.grab_set()
+        win.wait_window()
+        return result["value"]
 
     def insert_table_template(self):
         sel = self._editor_selection()
