@@ -83,7 +83,11 @@ def main():
 
     # --- 4. 正常输入仍然可用 ---
     out = m.build_video_markup(CLEAN, base)
-    check("纯净iframe保留", out.strip() == CLEAN.strip(), repr(out[:40]))
+    # v1.10.0：B站地址会被补上 autoplay=1（否则播放页要手动点才播），其余属性原样保留
+    check("纯净iframe保留(结构)", out.strip().startswith("<iframe") and
+          out.strip().endswith("</iframe>"))
+    check("纯净iframe补autoplay", "autoplay=1" in out)
+    check("纯净iframe保留属性", 'title="bilibili"' in out and "allowfullscreen" in out)
     check("纯净iframe带cid", "cid=42947642163" in out)
     check("video标记保留", m.build_video_markup(VIDEO_TAG, base).strip() == VIDEO_TAG)
     check("BV号可插", "player.bilibili.com" in m.build_video_markup("BV18asF6mEfy", base))

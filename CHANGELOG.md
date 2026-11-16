@@ -15,6 +15,26 @@ AIGC:
 
 > 提示：程序内「帮助 → 检查更新」读取的正是这里的 Release 版本号与说明，发版时请同步创建 Release 并填写更新内容。
 
+## v1.10.1（2026-11-16）
+**修复：预览区视频就是放不出来（`isOutside=true` 导致 B 站只回一帧静止画面）**
+- 根因：B 站播放地址模板里带了 `isOutside=true`。B 站收到该参数会按「站外引用」降级返回，内嵌窗口里只剩一帧静止画面——实测该区域整块接近全黑（亮度采样 nonblack≈0.0011），连续两次截图帧差≈0.0004，肉眼看就是黑屏；同一个 BV 号去掉该参数后立即出动态画面。
+- 修复：`BILI_PLAYER_URL` 去掉 `isOutside=true`，改为 `autoplay=1&high_quality=1&danmaku=1`；`bili_embed_src()` 拼地址也不再追加该参数。
+- 新增 `bili_clean_url()`：用户从网上抄来的旧 iframe / 播放器地址里带的 `isOutside`，在「插入标记」「预览播放页」「浏览器打开」三处统一摘掉，老文档不用重写。
+- 剥离动作写入日志（`logs\sg-md-editor-*.log`），出问题可直接复核最终播放地址。
+- 只删这一个参数，`bvid` / `cid` / `page` / `autoplay` / `high_quality` / `danmaku` 等其余参数原样保留。
+- 实测（v1.10.1 生成的播放页，Edge 内嵌同款窗口）：`BV1Uesp6yEsM` 亮度采样 nonblack=0.9955、连续两帧帧差 0.6319 → 动态画面正常起播；对照修复前同一视频 nonblack≈0.0011 / 帧差≈0.0004（静止黑屏）。
+- 回归：新增 `scripts/verify_video_v111.py`（28 / 28）；`verify_video_v180.py` 62 / 62、`verify_video_v181.py` 25 / 25、`verify_video_v110.py` 57 / 57、`verify_context_v190.py` 60 / 60、`verify_images_v170.py` 34 / 34、`verify_unsaved_v150.py` 25 / 25、`verify_update_v160.py` 28 / 28 全绿；`check_manual_lines.py` 失败 0。
+- 手册同步：`开发手册.md` 行号引用按新源码重算（`scripts/fix_manual_lines_v111.py`），并补记 `bili_clean_url` 的调用链与「不得再加 isOutside」的红线。
+- 版本号同步：`APP_VERSION` → `1.10.1`、`version_info.txt` → `1.10.1.0`。
+
+## v1.10.0（2026-11-16）
+**修复：预览区面板被压成 61 像素、播放窗口反复复用**
+- 视频面板改为挂在主窗口底部（`before=self.paned`），面板高度按 `VIDEO_PANEL_MIN_W` / `VIDEO_PANEL_MAX_H` 限制，不再被主分栏挤成 61 像素。
+- 每次播放使用独立 Edge 配置目录（`video_cache\profiles\`，保留最近 `VIDEO_PROFILE_KEEP` 个），避免复用旧进程导致「窗口起了但没画面」。
+- 播放页与本地视频改由本机回环 HTTP 服务提供（`VideoHttpServer`，127.0.0.1 随机端口）：`file://` 下 Chromium 会卡住跨源媒体与 iframe Referer，本地视频还支持 Range 以便拖动进度。
+- 本地 / 直链视频起播加固：先静音起播、成功后取消静音，失败重试 30 次并给出「视频加载失败」提示。
+- 全程日志加固：Edge 启动参数、pid、hwnd 轮询、样式位前后值、嵌入轮询次数、进程返回码全部落 `logs\`。
+
 ## v1.9.0（2026-11-16）
 **新增：输入框全中文右键菜单**
 - 三个输入区——左栏「① 命令速查录入」、中栏「② Markdown 编辑器」、右栏「③ 实时预览」——右键即可弹出中文菜单，不再落到 tkinter 的英文默认菜单或干脆没反应。

@@ -24,10 +24,13 @@ import ctypes
 import hashlib
 import json
 import logging
+import logging.handlers
 import queue
+import shutil
 import socket
 import subprocess
 import tempfile
+import uuid
 import threading
 import traceback
 import unicodedata
@@ -61,7 +64,7 @@ except Exception:  # pragma: no cover
 # 常量信息
 # ---------------------------------------------------------------------------
 APP_NAME = "爽哥MD编辑工具"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.1"
 AUTHOR = "杨爽"
 AI_TOOL = "Marvis"
 EMAIL = "675680672@qq.com"
@@ -88,11 +91,18 @@ IMAGE_CACHE_LIMIT = 32          # 解码缓存条数上限，超出整体清空
 # 说明：tkinter Text 无法承载 HTML，因此播放器是嵌入在预览栏底部的子窗口，不是文本流内元素。
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv")
 VIDEO_PANEL_H = 250             # 内嵌播放面板默认高度（像素）
+VIDEO_PANEL_MIN_W = 400         # 内嵌播放面板最小宽度（像素，v1.10.0 起横跨主窗口底部）
+VIDEO_PANEL_MAX_H = 420         # 内嵌播放面板最大高度（像素）
 VIDEO_EDGE_WAIT_MS = 12000      # 等待 Edge 播放窗口出现的最长时间（毫秒）
 VIDEO_WINDOW_POLL_MS = 250      # 轮询 Edge 播放窗口的间隔（毫秒）
 VIDEO_CACHE_DIR = "video_cache"  # 播放页与 Edge 独立配置目录（exe 同级）
+VIDEO_PROFILE_DIR = "profiles"   # 每次播放独立的 Edge 配置目录（v1.10.0：防进程复用）
+VIDEO_PROFILE_KEEP = 3           # 启动时保留最近几个 Edge 配置目录
+# v1.10.0：B 站播放器只有 autoplay=1 才会自动起播；旧版写死 autoplay=0，预览区只显示静止黑屏
+# v1.10.1：去掉 isOutside=true —— 带该参数时 B 站把播放器当站外引用，只回一帧静止画面
+# （实测画面几乎全黑、帧不变化），去掉后同一 BV 号立即正常播放。
 BILI_PLAYER_URL = ("https://player.bilibili.com/player.html?bvid=%s"
-                   "&page=1&autoplay=0&isOutside=true")
+                   "&page=1&autoplay=1&high_quality=1&danmaku=1")
 BILI_IFRAME_TPL = (
     '<iframe\n'
     '  src="%s"\n'
@@ -104,17 +114,55 @@ BILI_IFRAME_TPL = (
     '</iframe>'
 )
 VIDEO_TAG_TPL = '<video controls width="100%%" src="%s">\n</video>'
+# v1.10.0：本地/直链视频起播加固。Chromium 的自动播放策略在部分 Edge 版本上会无视
+# --autoplay-policy 参数，导致播放页停在首帧（用户看到"能出画面但不动"）。这里用
+# 「先静音起播 -> 起播成功后取消静音」的标准做法兜住，并主动重试、给出失败提示。
+PLAYER_AUTOPLAY_JS = (
+    '<script>\n'
+    '(function () {\n'
+    '  var v = document.querySelector("video");\n'
+    '  if (!v) { return; }\n'
+    '  var tries = 0;\n'
+    '  var unlock = function () { v.muted = false; };\n'
+    '  var attempt = function () {\n'
+    '    tries++;\n'
+    '    if (tries > 30) { return; }\n'
+    '    var p = v.play();\n'
+    '    if (!p || !p.then) { return; }\n'
+    '    p.then(unlock, function () {\n'
+    '      v.muted = true;\n'
+    '      var q = v.play();\n'
+    '      if (q && q.then) { q.then(unlock, function () { setTimeout(attempt, 300); }); }\n'
+    '      else { setTimeout(attempt, 300); }\n'
+    '    });\n'
+    '  };\n'
+    '  ["loadedmetadata", "canplay", "canplaythrough"].forEach(function (n) {\n'
+    '    v.addEventListener(n, attempt);\n'
+    '  });\n'
+    '  document.addEventListener("click", attempt);\n'
+    '  v.addEventListener("error", function () {\n'
+    '    document.title = "视频加载失败";\n'
+    '    document.body.insertAdjacentHTML("beforeend",\n'
+    '      "<p style=\\"color:#f88;font:14px/1.6 sans-serif;padding:12px\\">"\n'
+    '      + "视频加载失败，可点「浏览器打开」直接观看</p>");\n'
+    '  });\n'
+    '  attempt();\n'
+    '})();\n'
+    '</script>\n'
+)
 PLAYER_PAGE_TPL = (
     '<!doctype html>\n'
     '<html><head><meta charset="utf-8"><title>视频播放</title>\n'
     '<style>html,body{margin:0;height:100%%;background:#000;overflow:hidden}\n'
-    'iframe,video{width:100%%;height:100%%;border:0;display:block}</style></head>\n'
-    '<body>%s</body></html>'
+    'iframe,video{width:100%%;height:100%%;border:0;display:block;'
+    'object-fit:contain;background:#000}</style></head>\n'
+    '<body>%s%s</body></html>'
 )
 # 嵌入外部窗口用到的 Win32 常量：去掉弹出式标题栏，改成子窗口样式
 GWL_STYLE = -16
 WIN_DROP_STYLE = 0x80000000 | 0x00C00000 | 0x00040000 | 0x00080000   # POPUP|CAPTION|THICKFRAME|SYSMENU
 WIN_CHILD_STYLE = 0x40000000 | 0x10000000                           # CHILD|VISIBLE
+WM_CLOSE = 0x0010                                                   # 停止播放时先礼后兵
 
 # 在线检查更新（v1.6.0）：直接复用本项目的 GitHub 开源仓库 Releases 做版本比对，
 # 不依赖任何第三方更新服务器，也不上传任何本机信息。
@@ -965,12 +1013,17 @@ def _pick_log_dir():
 
 LOG_DIR = _pick_log_dir()
 LOG_FILE = os.path.join(LOG_DIR, "sg-md-editor-%s.log" % time.strftime("%Y%m%d"))
+LOG_MAX_BYTES = 2 * 1024 * 1024     # 单个日志文件上限 2 MB（v1.10.0）
+LOG_BACKUP_COUNT = 3                # 轮转后保留 3 个历史文件（v1.10.0）
 
 logger = logging.getLogger("shuage.md.editor")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 logger.propagate = False
 if not logger.handlers:
-    _handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8")
+    _handler.setLevel(logging.DEBUG)
     _handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     )
@@ -978,9 +1031,33 @@ if not logger.handlers:
 
 
 def log_action(action, detail=""):
-    """记录用户操作日志，便于反馈问题时定位。"""
+    """记录用户操作日志（INFO），便于反馈问题时定位。"""
     try:
         logger.info("%s | %s", action, detail)
+    except Exception:
+        pass
+
+
+def log_detail(action, detail=""):
+    """记录链路细节（DEBUG）：启动参数、进程 PID、hwnd、样式位等排障信息。"""
+    try:
+        logger.debug("%s | %s", action, detail)
+    except Exception:
+        pass
+
+
+def log_warn(action, detail=""):
+    """记录非致命异常（WARNING）：启动超时、进程提前退出、清理失败等。"""
+    try:
+        logger.warning("%s | %s", action, detail)
+    except Exception:
+        pass
+
+
+def log_error(action, detail=""):
+    """记录失败（ERROR）：进程启动失败、窗口嵌入失败、回调异常等。"""
+    try:
+        logger.error("%s | %s", action, detail)
     except Exception:
         pass
 
@@ -1353,14 +1430,15 @@ def bili_embed_src(text):
         return ""
     bvid = bv.group(0)
     if "player.bilibili.com" in value and "cid=" in value:
-        return value
+        # 已经是播放器地址：仍强制打开自动播放，否则内嵌窗口停在封面不播
+        return ensure_autoplay(value)
     page_m = re.search(r"[?&]p=(\d+)", value)
     page = page_m.group(1) if page_m else "1"
     cid_m = re.search(r"[?&]cid=(\d+)", value)
     url = "https://player.bilibili.com/player.html?bvid=%s" % bvid
     if cid_m:
         url += "&cid=%s" % cid_m.group(1)
-    return url + "&page=%s&autoplay=0&isOutside=true" % page
+    return ensure_autoplay(url + "&page=%s" % page)
 
 
 def video_insert_target(path, base_dir=None):
@@ -1475,23 +1553,286 @@ def render_video(widget, block, extra_tags=(), video_ctx=None):
         video_ctx.setdefault("paths", {})[index] = (kind, payload, label)
 
 
-def build_player_html(target):
-    """把播放目标包成一张本地播放页：B 站/网页用 iframe，本地视频用 <video>。"""
+_MEDIA_URL_RE = re.compile(
+    r"\.(?:%s)(?:$|[?#])" % "|".join(ext.lstrip(".") for ext in VIDEO_EXTENSIONS), re.I)
+
+
+def bili_clean_url(url):
+    """去掉 B 站播放地址里的 isOutside 参数（v1.10.1 修复预览区黑屏）。
+
+    用户从网上抄来的 iframe 常常自带 isOutside=true；B 站收到该参数会把播放器按
+    「站外引用」降级处理，回到预览窗口里的效果就是一帧静止画面（实测整块区域几乎
+    全黑、连续截图帧差≈0.0004）。这里直接把它摘掉，其余参数原样保留。
+    """
+    value = (url or "").strip()
+    if not re.search(r"[?&]isoutside=", value, re.I):
+        return value
+    head, _, query = value.partition("?")
+    frag = ""
+    if "#" in query:
+        query, _, frag = query.partition("#")
+    kept = [item for item in query.split("&")
+            if item and not item.lower().startswith("isoutside=")]
+    rebuilt = head + (("?" + "&".join(kept)) if kept else "")
+    if frag:
+        rebuilt += "#" + frag
+    log_action("B站播放地址已移除 isOutside 参数", rebuilt)
+    return rebuilt
+
+
+def ensure_autoplay(url):
+    """把 B 站播放地址的 autoplay 参数强制改成 1（内嵌预览必须自动起播）。"""
+    value = bili_clean_url(url)
+    if not value:
+        return value
+    if re.search(r"[?&]autoplay=", value):
+        return re.sub(r"([?&])autoplay=[^&#]*",
+                      lambda m: m.group(1) + "autoplay=1", value)
+    return value + ("&" if "?" in value else "?") + "autoplay=1"
+
+
+def media_url(url):
+    """网页地址本身是否就是媒体直链（.mp4/.webm/... 结尾）——这类地址必须用 <video> 播。"""
+    value = (url or "").strip()
+    if not value.lower().startswith(("http://", "https://")):
+        return False
+    return _MEDIA_URL_RE.search(value.split("#", 1)[0]) is not None
+
+
+class VideoHttpServer(object):
+    """本机回环 HTTP 服务：给内嵌播放器提供 http:// 播放页与本地视频流。
+
+    v1.10.0 修复：播放页原先用 file:// 打开，实测（temp/probe32~probe35）Chromium 在
+    file:// 页面里给子框架的 Referer 为空、跨源媒体请求也会被卡住，表现为 B 站播放器
+    整块黑屏（屏幕亮度掉到 0.2）、网页 mp4 永远停在 readyState=0 / currentTime=0；
+    同一批页面改由 http://127.0.0.1:<port>/ 提供后四类输入都能正常出画面。
+    因此播放页与本地视频统一走本机回环 HTTP，本地视频额外支持 Range 以便拖动进度。
+    """
+
+    MAX_CHUNK = 256 * 1024
+
+    def __init__(self):
+        self._pages = {}
+        self._media = {}
+        self._lock = threading.Lock()
+        self._httpd = None
+        self.port = 0
+        self.base_url = ""
+
+    # ---- 对外接口 -------------------------------------------------------
+    def start(self):
+        """启动服务；已在运行则直接复用。失败抛异常，由调用方兜底。"""
+        if self._httpd is not None:
+            return self
+        import http.server
+        import socketserver
+
+        owner = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            server_version = "SgMdVideo/1.0"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                owner._serve(self, True)
+
+            def do_HEAD(self):
+                owner._serve(self, False)
+
+        socketserver.ThreadingTCPServer.allow_reuse_address = True
+        self._httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler)
+        self._httpd.daemon_threads = True
+        self.port = self._httpd.server_address[1]
+        self.base_url = "http://127.0.0.1:%d" % self.port
+        threading.Thread(target=self._httpd.serve_forever,
+                         name="sg-md-video-http", daemon=True).start()
+        return self
+
+    def page_url(self, html):
+        """注册播放页 HTML 并返回可访问 URL（同内容复用同一 URL）。"""
+        if self._httpd is None:
+            self.start()
+        key = hashlib.md5(html.encode("utf-8")).hexdigest()[:12]
+        with self._lock:
+            self._pages[key] = html
+        return "%s/player/%s.html" % (self.base_url, key)
+
+    def media_url(self, path):
+        """注册本地视频并返回可访问 URL（支持 Range），同一路径复用同一 token。"""
+        if self._httpd is None:
+            self.start()
+        full = os.path.abspath(path)
+        token = hashlib.md5(full.encode("utf-8")).hexdigest()[:12]
+        with self._lock:
+            self._media[token] = full
+        return "%s/media/%s" % (self.base_url, token)
+
+    def shutdown(self):
+        httpd, self._httpd = self._httpd, None
+        if httpd is not None:
+            try:
+                httpd.shutdown()
+                httpd.server_close()
+            except Exception as exc:
+                log_detail("本地视频服务关闭异常", repr(exc))
+
+    # ---- 路由 -----------------------------------------------------------
+    def _serve(self, h, with_body):
+        import mimetypes
+        import urllib.parse
+        path = urllib.parse.urlsplit(h.path or "/").path
+        parts = [p for p in path.split("/") if p]
+        try:
+            if len(parts) == 2 and parts[0] == "player":
+                key = parts[1][:-5] if parts[1].endswith(".html") else parts[1]
+                with self._lock:
+                    html = self._pages.get(key)
+                if html is None:
+                    self._send_plain(h, 404, "page not found")
+                    return
+                body = html.encode("utf-8")
+                h.send_response(200)
+                h.send_header("Content-Type", "text/html; charset=utf-8")
+                h.send_header("Content-Length", str(len(body)))
+                h.send_header("Cache-Control", "no-store")
+                h.end_headers()
+                if with_body:
+                    h.wfile.write(body)
+                return
+            if len(parts) == 2 and parts[0] == "media":
+                with self._lock:
+                    full = self._media.get(parts[1])
+                if not full or not os.path.isfile(full):
+                    log_warn("本地视频路由命中失败", "token=%s | 文件=%s" % (parts[1], full))
+                    self._send_plain(h, 404, "media not found")
+                    return
+                self._send_file(h, full, mimetypes, with_body)
+                return
+            self._send_plain(h, 404, "not found")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            log_warn("本地视频服务处理请求失败", "%s | %r" % (h.path, exc))
+
+    def _send_file(self, h, full, mimetypes, with_body):
+        """带 Range 的文件流：Chromium 播放视频会先发 Range 请求，必须回 206 才能拖动。"""
+        size = os.path.getsize(full)
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        start, end, status = 0, size - 1, 200
+        rng = h.headers.get("Range") if h.headers else None
+        if rng and rng.startswith("bytes="):
+            spec = rng[6:].split(",")[0].strip()
+            head, _sep, tail = spec.partition("-")
+            try:
+                if head:
+                    start = max(0, int(head))
+                    end = int(tail) if tail else size - 1
+                elif tail:
+                    start = max(0, size - int(tail))
+                if start > end or start >= size:
+                    start, end, status = 0, size - 1, 200
+                else:
+                    end = min(end, size - 1)
+                    status = 206
+            except ValueError:
+                start, end, status = 0, size - 1, 200
+        length = (end - start + 1) if size else 0
+        h.send_response(status)
+        h.send_header("Content-Type", ctype)
+        h.send_header("Accept-Ranges", "bytes")
+        h.send_header("Content-Length", str(length))
+        if status == 206:
+            h.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        h.end_headers()
+        if not with_body or length <= 0:
+            return
+        with open(full, "rb") as fp:
+            fp.seek(start)
+            remain = length
+            while remain > 0:
+                chunk = fp.read(min(self.MAX_CHUNK, remain))
+                if not chunk:
+                    break
+                h.wfile.write(chunk)
+                remain -= len(chunk)
+
+    @staticmethod
+    def _send_plain(h, code, msg):
+        body = msg.encode("utf-8")
+        h.send_response(code)
+        h.send_header("Content-Type", "text/plain; charset=utf-8")
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+
+_VIDEO_HTTP = None
+_VIDEO_HTTP_FAILED = False
+
+
+def video_http_server():
+    """取（必要时启动）全局播放页 http 服务；失败返回 None，调用方退回 file://。"""
+    global _VIDEO_HTTP, _VIDEO_HTTP_FAILED
+    if _VIDEO_HTTP is not None:
+        return _VIDEO_HTTP
+    if _VIDEO_HTTP_FAILED:
+        return None
+    try:
+        srv = VideoHttpServer().start()
+        _VIDEO_HTTP = srv
+        log_action("本地视频服务已启动", "端口=%d | 地址=%s" % (srv.port, srv.base_url))
+        return srv
+    except Exception as exc:
+        _VIDEO_HTTP_FAILED = True
+        log_error("本地视频服务启动失败", repr(exc))
+        return None
+
+
+def _player_media_src(payload, server=None):
+    """本地视频在播放页里的 src：优先本地 http 源（同源且支持 Range），否则退回 file://。"""
+    if server is not None:
+        try:
+            return server.media_url(payload)
+        except Exception as exc:
+            log_warn("本地视频转 http 源失败", "%s | %r" % (payload, exc))
+    return file_url(payload)
+
+
+def build_player_html(target, server=None):
+    """把播放目标包成一张本地播放页：B 站/普通网页用 <iframe>，媒体直链与本地视频用 <video>。
+
+    server 传 VideoHttpServer 时，本地视频改由本地 http 源提供（file:// 下 Chromium 会
+    卡住跨源媒体与 iframe Referer，见 VideoHttpServer 注释）。
+    """
     kind, payload, _label = target
+    script = ""
     if kind == "bili":
+        src = ensure_autoplay(payload if str(payload).lower().startswith("http")
+                              else BILI_PLAYER_URL % payload)
         inner = ('<iframe src="%s" title="哔哩哔哩视频播放器" '
                  'allow="fullscreen; autoplay; encrypted-media; picture-in-picture" '
-                 'allowfullscreen loading="lazy"></iframe>'
-                 % html_escape(payload))
+                 'allowfullscreen></iframe>' % html_escape(src))
     elif kind == "web":
-        inner = ('<iframe src="%s" title="网页播放器" '
-                 'allow="fullscreen; autoplay; encrypted-media; picture-in-picture" '
-                 'allowfullscreen loading="lazy"></iframe>' % html_escape(payload))
+        # v1.10.0：Chromium 不允许在 iframe 内直接渲染媒体文件（会显示破损图标错误页），
+        # 因此把 *.mp4 之类的直链改用 <video> 播放；普通网页仍交给 iframe。
+        if media_url(payload):
+            inner = ('<video controls autoplay playsinline muted preload="auto" '
+                     'src="%s"></video>' % html_escape(payload))
+            script = PLAYER_AUTOPLAY_JS
+        else:
+            inner = ('<iframe src="%s" title="网页播放器" '
+                     'allow="fullscreen; autoplay; encrypted-media; picture-in-picture" '
+                     'allowfullscreen></iframe>' % html_escape(payload))
     elif kind == "local":
-        inner = '<video controls autoplay src="%s"></video>' % html_escape(file_url(payload))
+        inner = ('<video controls autoplay playsinline muted preload="auto" '
+                 'src="%s"></video>' % html_escape(_player_media_src(payload, server)))
+        script = PLAYER_AUTOPLAY_JS
     else:
         return ""
-    return PLAYER_PAGE_TPL % inner
+    return PLAYER_PAGE_TPL % (inner, script)
 
 
 def find_edge_exe():
@@ -2438,6 +2779,8 @@ class MdToolApp:
         self._video_hwnd = None
         self._video_current = None
         self._video_deadline = 0.0
+        self._video_polls = 0          # 已轮询次数（v1.10.0，写入链路日志）
+        self._video_profile = None     # 本次播放专用的 Edge 配置目录（v1.10.0）
         # 最近一次有效选区（起点, 终点, 文本）：按钮点击抢走焦点后选区高亮会消失，
         # 用它兜底，保证"选中文本 + 点按钮"仍能套用模板。
         self._last_selection = None
@@ -2473,6 +2816,11 @@ class MdToolApp:
         # 启动时静默检查更新（默认关闭，设置窗口可开）：只写日志与状态栏，不打断操作
         self._auto_update_job = None
         self._update_auto_check(delay=2600)
+        # v1.10.0：清掉历史播放遗留的 Edge 配置目录，避免 video_cache 无限膨胀
+        try:
+            self._cleanup_video_profiles()
+        except Exception as exc:
+            log_warn("清理历史 Edge 配置目录异常", repr(exc))
         log_action("启动", "%s v%s | 日志 %s" % (APP_NAME, APP_VERSION, LOG_FILE))
 
     # ---------------- 界面构建 ----------------
@@ -2751,9 +3099,10 @@ class MdToolApp:
                               font=(FONT_CN, 9)),
                     palette, None, "hint_fg").pack(side="left")
         # 内嵌视频播放面板（v1.8.0）：默认隐藏，点预览里的「▶ 视频」条目才出现。
-        # tkinter 的 Text 放不了 HTML 播放器，所以播放器是嵌在本栏底部的子窗口（Edge 内核）。
+        # tkinter 的 Text 放不了 HTML 播放器，所以播放器是 Edge 内核的独立子窗口。
+        # v1.10.0：面板改为挂在主窗口底部并横跨整窗，画面比原先塞在预览栏里大得多。
         self.video_title_var = tk.StringVar(value="")
-        self.video_panel = ttk.LabelFrame(right, text=" ▶ 视频播放器 ")
+        self.video_panel = ttk.LabelFrame(self.root, text=" ▶ 视频播放器 ")
         video_head = ttk.Frame(self.video_panel)
         video_head.pack(fill="x", padx=6, pady=(2, 0))
         ttk.Button(video_head, text="关闭", padding=(6, 1),
@@ -2769,7 +3118,8 @@ class MdToolApp:
         self.video_host.pack_propagate(False)
         self._video_tip = tk.Label(self.video_host, bg="#000000", fg="#8b949e",
                                    font=(FONT_CN, 9),
-                                   text="点上方预览里的「▶ 视频」条目开始播放")
+                                   text="点上方预览里的「▶ 视频」条目开始播放"
+                                        "（部分网站禁止被嵌入，可点「浏览器打开」）")
         self._video_tip.pack(expand=True)
         self.video_host.bind("<Configure>", self._place_video_window, add="+")
 
@@ -3353,22 +3703,34 @@ class MdToolApp:
         return "break"
 
     def _activate_video_panel(self):
-        """把播放面板挂到预览栏底部（已挂则不动）。"""
+        """把播放面板挂到主窗口底部（横跨整窗，画面更大）；已挂则不动。
+
+        注意 packing 顺序：paned 是 fill="both", expand=True，若在它之后 pack 面板，
+        剩余空间为 0，面板会被压成一条（历史 bug：播放区高仅 61 像素，视频几乎看不见）。
+        因此这里用 before=self.paned 把它插到 paned 之前，先分到固定高度。
+        """
         try:
             if not self.video_panel.winfo_manager():
-                self.video_panel.pack(side="bottom", fill="x", padx=6,
-                                      pady=(0, 6), before=self._right_wrap)
+                self.video_panel.pack(side="bottom", fill="x", padx=8, pady=(0, 6),
+                                      before=self.paned)
+                log_detail("视频面板展开", "挂载位置=主窗口底部（before=paned）")
         except Exception as exc:
-            log_action("视频面板展开失败", repr(exc))
+            log_error("视频面板展开失败", repr(exc))
 
     def _resize_video_host(self):
-        """播放面板高度贴合 16:9，避免 16:9 内容被压扁（180~420 像素之间）。"""
+        """按主窗口宽度算播放区高度（16:9，200~VIDEO_PANEL_MAX_H 像素）。"""
         try:
-            width = max(320, int(self._right_wrap.winfo_width()) - 30)
-            height = max(180, min(int(width * 9 / 16.0), 420))
-            self.video_host.configure(height=height)
+            width = max(VIDEO_PANEL_MIN_W, int(self.root.winfo_width()) - 48)
         except Exception:
-            pass
+            width = 720
+        height = max(200, min(int(width * 9 / 16.0), VIDEO_PANEL_MAX_H))
+        try:
+            self.video_host.configure(width=width, height=height)
+            self.video_panel.update_idletasks()
+        except Exception as exc:
+            log_detail("视频播放区尺寸设置失败", repr(exc))
+        log_detail("视频播放区尺寸", "%dx%d" % (width, height))
+        return width, height
 
     def _play_video(self, target):
         """按播放目标拉起内嵌播放器；同一目标重复点击不重开进程。"""
@@ -3381,8 +3743,12 @@ class MdToolApp:
         self._video_current = target
         html = build_player_html(target)
         if not html:
+            log_warn("视频地址不可播放", "kind=%s | payload=%s" % (kind, payload))
             messagebox.showwarning(APP_NAME, "这个视频地址无法播放。", parent=self.root)
             return
+        log_detail("播放目标", "kind=%s | 方式=%s | payload=%s | 页面字节=%d"
+                   % (kind, "iframe" if kind == "bili" or not media_url(payload)
+                      else "video", payload, len(html)))
         self._activate_video_panel()
         self._resize_video_host()
         self.root.update_idletasks()
@@ -3392,10 +3758,74 @@ class MdToolApp:
         if self._spawn_video_window(html):
             self.status_var.set("正在加载视频：%s" % label)
 
+    def _new_video_profile(self, cache_dir):
+        """为本次播放新建独立 Edge 配置目录：避免复用已运行 Edge 进程导致窗口找不到。"""
+        base = os.path.join(cache_dir, VIDEO_PROFILE_DIR)
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception as exc:
+            log_warn("Edge 配置目录创建失败", repr(exc))
+            return os.path.join(base, "edge_%d" % int(time.time()))
+        profile = os.path.join(base, "edge_%s_%s" % (
+            time.strftime("%Y%m%d%H%M%S"), uuid.uuid4().hex[:6]))
+        log_detail("Edge 配置目录", profile)
+        return profile
+
+    def _drop_video_profile(self):
+        """删除本次播放的临时 Edge 配置目录（Edge 刚退出时文件可能仍被占用，故重试）。"""
+        profile = getattr(self, "_video_profile", None)
+        self._video_profile = None
+        if not profile:
+            return
+        last = None
+        for attempt in range(3):
+            if not os.path.isdir(profile):
+                log_detail("Edge 配置目录已清理", profile)
+                return
+            try:
+                shutil.rmtree(profile, ignore_errors=False)
+                log_detail("Edge 配置目录已清理",
+                           "%s（第 %d 次尝试）" % (profile, attempt + 1))
+                return
+            except Exception as exc:
+                last = exc
+                time.sleep(0.2)
+        log_warn("Edge 配置目录清理失败（下次启动会再清理）", "%s | %r" % (profile, last))
+
+    def _cleanup_video_profiles(self, keep=VIDEO_PROFILE_KEEP):
+        """启动时清理历史 Edge 配置目录，只保留最近 keep 个（避免无限增长）。"""
+        base = os.path.join(video_cache_dir(), VIDEO_PROFILE_DIR)
+        if not os.path.isdir(base):
+            return 0
+        items = []
+        try:
+            for name in os.listdir(base):
+                full = os.path.join(base, name)
+                if os.path.isdir(full):
+                    try:
+                        items.append((os.path.getmtime(full), full))
+                    except OSError:
+                        pass
+        except Exception as exc:
+            log_warn("扫描历史 Edge 配置目录失败", repr(exc))
+            return 0
+        items.sort(reverse=True)
+        removed = 0
+        for _mtime, full in items[keep:]:
+            try:
+                shutil.rmtree(full, ignore_errors=True)
+                removed += 1
+            except Exception:
+                pass
+        log_detail("清理历史 Edge 配置目录", "保留 %d 个，移除 %d 个 | %s"
+                   % (min(len(items), keep), removed, base))
+        return removed
+
     def _spawn_video_window(self, html):
         """把播放页写成临时 HTML，用 Edge 应用窗口模式拉起，随后嵌进播放面板。"""
         edge = find_edge_exe()
         if not edge:
+            log_warn("视频播放器不可用", "未找到 msedge.exe")
             messagebox.showwarning(
                 APP_NAME,
                 "没有找到 Microsoft Edge。\n\n"
@@ -3410,38 +3840,70 @@ class MdToolApp:
             with open(page, "w", encoding="utf-8") as fp:
                 fp.write(html)
         except Exception as exc:
-            log_action("视频播放页写入失败", repr(exc))
+            log_error("视频播放页写入失败", repr(exc))
             messagebox.showwarning(APP_NAME, "无法创建视频播放页：\n%r" % (exc,),
                                    parent=self.root)
             return False
+        # v1.10.0：播放页改由本机回环 http 服务提供。file:// 页面下 Chromium 会给子框架
+        # 传空 Referer 并卡住跨源媒体，实测导致 B 站整块黑屏、网页 mp4 readyState 恒为 0
+        # （temp/probe32~probe35 证据）；改走 http://127.0.0.1:<port>/ 后四类输入均出画面。
+        page_url = file_url(page)
+        server = video_http_server()
+        if server is not None:
+            try:
+                if self._video_current:
+                    html = build_player_html(self._video_current, server=server)
+                    with open(page, "w", encoding="utf-8") as fp:
+                        fp.write(html)
+                page_url = server.page_url(html)
+                log_detail("视频播放页改走本地 http 源",
+                           "端口=%d | 页面=%s" % (server.port, page_url))
+            except Exception as exc:
+                log_warn("本地 http 源不可用，退回 file://", repr(exc))
+                page_url = file_url(page)
+        else:
+            log_warn("本地 http 源不可用，退回 file://", "video_http_server() 返回 None")
         try:
-            width = max(360, int(self.video_host.winfo_width()))
+            width = max(VIDEO_PANEL_MIN_W, int(self.video_host.winfo_width()))
             height = max(240, int(self.video_host.winfo_height()) + 80)
         except Exception:
-            width, height = 720, 400
+            width, height = 720, 480
+        profile = self._new_video_profile(cache_dir)
+        self._video_profile = profile
         args = [
             edge,
-            "--app=%s" % file_url(page),
-            "--user-data-dir=%s" % os.path.join(cache_dir, "edgeprofile"),
+            "--app=%s" % page_url,
+            "--user-data-dir=%s" % profile,
             "--window-size=%d,%d" % (width, height),
             "--autoplay-policy=no-user-gesture-required",
             "--no-first-run", "--no-default-browser-check",
             "--disable-features=Translate",
+            # 内嵌窗口常被系统判成遮挡/后台窗口，这三项避免渲染与定时器被节流而不出画面
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
         ]
+        log_detail("启动视频播放器", " | ".join(args))
         try:
             self._video_proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception as exc:
-            log_action("视频播放器启动失败", repr(exc))
+            log_error("视频播放器启动失败", repr(exc))
             self._video_proc = None
+            self._drop_video_profile()
             messagebox.showwarning(APP_NAME, "视频播放器启动失败：\n%r" % (exc,),
                                    parent=self.root)
             return False
+        log_action("视频播放器已启动", "pid=%s | 尺寸=%dx%d | 配置目录=%s"
+                   % (self._video_proc.pid, width, height, profile))
         self._video_hwnd = None
+        self._video_polls = 0
         self._video_deadline = time.time() + VIDEO_EDGE_WAIT_MS / 1000.0
         self.root.after(VIDEO_WINDOW_POLL_MS, self._watch_video_window)
-        log_action("视频播放", "%s | %s" % (page, edge))
+        log_action("视频播放", "%s | 页=%s | pid=%s | profile=%s"
+                   % (self.video_title_var.get() or "-", page,
+                      self._video_proc.pid, profile))
         return True
 
     def _watch_video_window(self):
@@ -3451,15 +3913,27 @@ class MdToolApp:
         if self._video_hwnd:
             self._place_video_window()
             return
-        hwnd = find_window_by_pid(self._video_proc.pid)
+        self._video_polls = getattr(self, "_video_polls", 0) + 1
+        try:
+            hwnd = find_window_by_pid(self._video_proc.pid)
+        except Exception as exc:
+            hwnd = 0
+            log_error("查找播放窗口异常", repr(exc))
+        log_detail("等待播放窗口", "第 %d 次 | pid=%s | hwnd=%s | 剩余 %.1fs"
+                   % (self._video_polls, self._video_proc.pid, hwnd,
+                      max(0.0, self._video_deadline - time.time())))
         if hwnd and self._embed_video_window(hwnd):
             return
-        if self._video_proc.poll() is not None:
-            self._stop_video(silent=True)
-            self.status_var.set("视频播放器已退出")
-            return
+        exited = self._video_proc.poll() is not None
+        if exited:
+            log_warn("播放器进程已退出", "pid=%s 返回码=%s"
+                     % (self._video_proc.pid, self._video_proc.returncode))
         if time.time() > self._video_deadline:
+            log_warn("视频窗口等待超时", "已轮询 %d 次 | 进程已退出=%s"
+                     % (self._video_polls, exited))
             self.status_var.set("视频加载较慢，可点「浏览器打开」直接观看")
+            if exited:
+                self.status_var.set("视频播放器已退出")
             self._stop_video(silent=True)
             return
         self.root.after(VIDEO_WINDOW_POLL_MS, self._watch_video_window)
@@ -3469,10 +3943,16 @@ class MdToolApp:
         user32 = ctypes.windll.user32
         try:
             parent = self.video_host.winfo_id()
-            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-            style = (style & ~WIN_DROP_STYLE) | WIN_CHILD_STYLE
+            old_style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            style = (old_style & ~WIN_DROP_STYLE) | WIN_CHILD_STYLE
             user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+            new_style = user32.GetWindowLongW(hwnd, GWL_STYLE)
             user32.SetParent(hwnd, parent)
+            log_detail("视频窗口样式与挂载",
+                       "hwnd=%s | host=%s | style %#x → %#x（读回 %#x）| SetParent 后父窗口=%s"
+                       % (hwnd, parent, old_style & 0xFFFFFFFF,
+                          style & 0xFFFFFFFF, new_style & 0xFFFFFFFF,
+                          user32.GetParent(hwnd)))
             self._video_hwnd = hwnd
             try:
                 self._video_tip.pack_forget()
@@ -3480,10 +3960,11 @@ class MdToolApp:
                 pass
             self._place_video_window()
         except Exception as exc:
-            log_action("视频窗口嵌入失败", repr(exc))
+            log_error("视频窗口嵌入失败", "hwnd=%s | %r" % (hwnd, exc))
             self._video_hwnd = None
             return False
-        log_action("视频窗口已嵌入", "hwnd=%s" % hwnd)
+        log_action("视频窗口已嵌入", "hwnd=%s | 轮询 %d 次"
+                   % (hwnd, getattr(self, "_video_polls", 0)))
         return True
 
     def _place_video_window(self, event=None):
@@ -3493,13 +3974,19 @@ class MdToolApp:
         try:
             width = max(1, int(self.video_host.winfo_width()))
             height = max(1, int(self.video_host.winfo_height()))
-            ctypes.windll.user32.MoveWindow(self._video_hwnd, 0, 0,
-                                            width, height, True)
-        except Exception:
-            pass
+            if not ctypes.windll.user32.MoveWindow(self._video_hwnd, 0, 0,
+                                                   width, height, True):
+                log_detail("视频窗口定位失败", "hwnd=%s | %dx%d"
+                           % (self._video_hwnd, width, height))
+            elif not getattr(self, "_video_placed", False):
+                self._video_placed = True
+                log_detail("视频窗口已铺满播放区", "hwnd=%s | %dx%d"
+                           % (self._video_hwnd, width, height))
+        except Exception as exc:
+            log_error("视频窗口定位异常", repr(exc))
 
     def _stop_video(self, silent=False):
-        """停止播放：解除父子关系、结束 Edge 播放进程、收起播放面板。"""
+        """停止播放：解除父子关系、结束 Edge 播放进程、清理临时配置目录、收起面板。"""
         hwnd, proc = self._video_hwnd, self._video_proc
         self._video_hwnd = None
         self._video_proc = None
@@ -3507,17 +3994,24 @@ class MdToolApp:
         if hwnd:
             try:
                 ctypes.windll.user32.SetParent(hwnd, 0)
-            except Exception:
-                pass
+                # 先礼后兵：让窗口自己关闭，避免进程已 daemon 化时留下孤立窗口
+                ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            except Exception as exc:
+                log_detail("视频窗口解挂失败", repr(exc))
         if proc is not None:
             try:
                 proc.terminate()
                 proc.wait(timeout=3)
+                log_detail("视频播放进程已结束", "pid=%s | 返回码=%s"
+                           % (proc.pid, proc.returncode))
             except Exception:
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                    log_warn("视频播放进程强制结束", "pid=%s" % proc.pid)
+                except Exception as exc:
+                    log_warn("视频播放进程结束失败", repr(exc))
+        self._video_placed = False
+        self._drop_video_profile()
         try:
             self.video_panel.pack_forget()
         except Exception:
@@ -3526,6 +4020,9 @@ class MdToolApp:
             self._video_tip.pack(expand=True)
         except Exception:
             pass
+        if hwnd or proc is not None:
+            log_action("视频播放已关闭", "hwnd=%s | pid=%s"
+                       % (hwnd or "-", getattr(proc, "pid", "-")))
         if not silent:
             self.status_var.set("已关闭视频播放器")
 
@@ -3537,7 +4034,8 @@ class MdToolApp:
             return
         kind, payload, label = target
         if kind == "bili":
-            url = payload if payload.startswith("http") else BILI_PLAYER_URL % payload
+            url = bili_clean_url(payload if payload.startswith("http")
+                                 else BILI_PLAYER_URL % payload)
         elif kind == "web":
             url = payload
         else:
