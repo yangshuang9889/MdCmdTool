@@ -64,7 +64,7 @@ except Exception:  # pragma: no cover
 # 常量信息
 # ---------------------------------------------------------------------------
 APP_NAME = "爽哥MD编辑工具"
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.1"
 AUTHOR = "杨爽"
 AI_TOOL = "Marvis"
 EMAIL = "675680672@qq.com"
@@ -90,6 +90,30 @@ IMAGE_CACHE_LIMIT = 32          # 解码缓存条数上限，超出整体清空
 # 单击预览里的「▶ 视频」条目，在预览区下方的内嵌面板里用系统 Edge（Chromium 内核）真播放。
 # 说明：tkinter Text 无法承载 HTML，因此播放器是嵌入在预览栏底部的子窗口，不是文本流内元素。
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv")
+
+# 文档资源文件夹（v1.11.0）：插入的本地图片 / 视频默认复制到文档同级的
+# 「<文档名>.assets」文件夹，文档里只写相对路径。这样整包（.md + 资源文件夹）
+# 发给别人，换台机器、换一个 Markdown 编辑器都能正常显示，不会因为绝对路径失效。
+ASSET_DIR_SUFFIX = ".assets"     # 资源文件夹后缀（可在设置里改）
+ASSET_DIR_ROOT = "assets"        # 文档名为空时的文件夹名
+ASSET_NAME_MAX = 60              # 复制进资源文件夹时文件名主体的最大长度
+ASSET_SUFFIX_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+
+# 语法编辑自动补全（v1.11.0）：Typing 时以「语法符号成对补全 + 右侧符号跳过 + 列表自动续行」
+# 让传统 Markdown 源码编辑也能顺手，不必每次都回头点工具栏按钮。
+AUTO_PAIR_STAR = "**"            # 连打两个 * 自动补成 ****，光标居中
+AUTO_PAIR_TICK = "`"             # 反引号成对
+AUTO_PAIR_WRAP = {"(": ")", "[": "]", "{": "}", '"': '"', "`": "`", "*": "*"}
+AUTO_INDENT = "  "               # Tab 缩进单位（两个空格，列表嵌套友好）
+AUTO_PAIR_IDS = ("asterisk", "grave", "bracketleft", "braceleft",
+                 "parenleft", "quotedbl")
+_AUTO_LIST_RE = re.compile(r"^(\s*)([-*+])(\s+)(\[[ xX]\]\s+)?")
+_AUTO_ORDER_RE = re.compile(r"^(\s*)(\d+)([.)])(\s+)(\[[ xX]\]\s+)?")
+_AUTO_QUOTE_RE = re.compile(r"^(\s*)(>+)(\s?)")
+# 文档资源本地化（v1.11.0）用到的两个匹配：Markdown 图片、HTML 视频 src
+_ASSET_MD_IMAGE_RE = re.compile(r"(!\[[^\]\n]*\]\(\s*)(<[^>\n]*>|[^)\n]+?)(\s*\))")
+_ASSET_HTML_SRC_RE = re.compile(
+    r'(<(?:video|source|iframe)\b[^>]*?\bsrc\s*=\s*")([^"]*)(")', re.I)
 VIDEO_PANEL_H = 250             # 内嵌播放面板默认高度（像素）
 VIDEO_PANEL_MIN_W = 400         # 内嵌播放面板最小宽度（像素，v1.10.0 起横跨主窗口底部）
 VIDEO_PANEL_MAX_H = 420         # 内嵌播放面板最大高度（像素）
@@ -113,7 +137,10 @@ BILI_IFRAME_TPL = (
     '  style="width:100%%; aspect-ratio:16/9; border:0;">\n'
     '</iframe>'
 )
-VIDEO_TAG_TPL = '<video controls width="100%%" src="%s">\n</video>'
+VIDEO_TAG_TPL = '<video controls width="100%%" preload="metadata" src="%s">\n</video>'
+# v1.11.0：Chromium 内核（Edge）实际不支持这些容器，插入后能生成标记但预览区大概率黑屏/无法播放，
+# 插入时先提示用户转码，省得以为是工具坏了。
+VIDEO_WEAK_EXTS = (".mkv", ".avi", ".flv", ".wmv", ".rmvb", ".rm", ".ts", ".mpg", ".mpeg")
 # v1.10.0：本地/直链视频起播加固。Chromium 的自动播放策略在部分 Edge 版本上会无视
 # --autoplay-policy 参数，导致播放页停在首帧（用户看到"能出画面但不动"）。这里用
 # 「先静音起播 -> 起播成功后取消静音」的标准做法兜住，并主动重试、给出失败提示。
@@ -743,14 +770,18 @@ PANEL_MIN_WIDTH = {"left": 150, "middle": 280, "right": 220}
 
 
 def default_settings():
-    """默认配置：白色主题、三栏全显示、不指定尺寸与分隔条。"""
+    """默认配置：白色主题、三栏全显示、不指定尺寸与分隔条；
+    v1.11.0 起新增「语法自动补全 / 资源文件夹」三项，默认都开启。"""
     return {"version": APP_VERSION,
             "theme": THEME_LIGHT,
             "panels": dict(PANEL_DEFAULT_VISIBLE),
             "geometry": "",
             "sash": [],
             "sash_width": 0,
-            "auto_check_update": False}
+            "auto_check_update": False,
+            "auto_pair": True,
+            "copy_assets": True,
+            "asset_suffix": ASSET_DIR_SUFFIX}
 
 
 def _sanitize_settings(raw):
@@ -792,7 +823,28 @@ def _sanitize_settings(raw):
     auto_check = raw.get("auto_check_update")
     if isinstance(auto_check, bool):
         data["auto_check_update"] = auto_check
+    # v1.11.0：语法自动补全开关 / 插入资源时复制到资源文件夹 / 资源文件夹后缀
+    auto_pair = raw.get("auto_pair")
+    if isinstance(auto_pair, bool):
+        data["auto_pair"] = auto_pair
+    copy_assets = raw.get("copy_assets")
+    if isinstance(copy_assets, bool):
+        data["copy_assets"] = copy_assets
+    suffix = raw.get("asset_suffix")
+    if isinstance(suffix, str):
+        suffix = suffix.strip()
+        if suffix and ASSET_SUFFIX_RE.match(suffix):
+            data["asset_suffix"] = suffix
     return data
+
+
+def asset_suffix_of(settings):
+    """从配置里取资源文件夹后缀，非法值回退默认（读写两侧共用同一判定）。"""
+    if isinstance(settings, dict):
+        suffix = settings.get("asset_suffix")
+        if isinstance(suffix, str) and ASSET_SUFFIX_RE.match(suffix.strip()):
+            return suffix.strip()
+    return ASSET_DIR_SUFFIX
 
 
 def load_settings():
@@ -1309,8 +1361,8 @@ def render_image(widget, alt, src, extra_tags, image_ctx=None):
         widget.insert("end", "[图片] %s（%s）" % (label, exc), tags + ("imgfail",))
 
 
-def image_insert_target(path, base_dir=None):
-    """算出写进 Markdown 的图片地址：优先相对文档目录，跨盘用绝对路径，含空格用 <> 包裹。"""
+def local_ref(path, base_dir=None):
+    """本地绝对路径 → 文档里可用的 / 分隔路径：能算出相对路径就用相对路径，跨盘才用绝对路径。"""
     target = os.path.abspath(path)
     base = base_dir or os.getcwd()
     try:
@@ -1319,10 +1371,152 @@ def image_insert_target(path, base_dir=None):
         rel = ""
     if rel and rel != os.pardir and not rel.startswith(".." + os.sep):
         target = rel
-    text = str(target).replace("\\", "/")
-    if " " in text:
+    return str(target).replace("\\", "/")
+
+
+def md_local_ref(path, base_dir=None):
+    """写进 Markdown 语法的本地路径（![说明](路径)）：含空格时用 <> 包裹。
+
+    说明：给 Markdown 用的一律用「相对路径 + <> 包裹」，不用 %20 编码——
+    第三方编辑器（Typora / VS Code / Obsidian）对 <> 的支持最一致，
+    而 %20 在部分编辑器里会当成文件名字面量，导致图片不显示（v1.11.0 修）。
+    """
+    text = local_ref(path, base_dir)
+    if " " in text and not text.startswith("<"):
         text = "<%s>" % text
     return text
+
+
+def html_local_ref(path, base_dir=None):
+    """写进 HTML 属性（<video src="…">）的本地路径：引号内允许空格，不做百分号编码。
+
+    v1.11.0：以前走 quote() 会把中文和空格全部转义成 %XX，人看不懂，
+    个别编辑器也不认；HTML 属性本身允许原样空格，保持可读性更好。
+    """
+    return local_ref(path, base_dir)
+
+
+def doc_asset_dir(doc_path, suffix=ASSET_DIR_SUFFIX):
+    """文档对应的资源文件夹绝对路径：<文档目录>/<文档名><后缀>；文档未保存返回空串。"""
+    if not doc_path:
+        return ""
+    try:
+        path = os.path.abspath(doc_path)
+    except Exception:
+        return ""
+    stem = os.path.splitext(os.path.basename(path))[0].strip()
+    if not stem:
+        stem = ASSET_DIR_ROOT
+    return os.path.join(os.path.dirname(path), stem + (suffix or ASSET_DIR_SUFFIX))
+
+
+def safe_asset_name(src):
+    """源文件名 → 安全的资源文件名：清掉非法字符、限长，保留扩展名。"""
+    name = os.path.basename(src or "") or "asset"
+    stem, ext = os.path.splitext(name)
+    stem = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", stem).strip(" .") or "asset"
+    if len(stem) > ASSET_NAME_MAX:
+        stem = stem[:ASSET_NAME_MAX].rstrip(" .") or "asset"
+    ext = re.sub(r'[\\/:*?"<>|\r\n\t]', "", ext)[:16]
+    return stem + ext
+
+
+def unique_file_path(folder, name):
+    """在 folder 里取一个不冲突的文件名：name → name-1 → name-2 …（同目录同名资源不互相覆盖）。"""
+    dst = os.path.join(folder, name)
+    if not os.path.exists(dst):
+        return dst
+    stem, ext = os.path.splitext(name)
+    for idx in range(1, 10000):
+        cand = os.path.join(folder, "%s-%d%s" % (stem, idx, ext))
+        if not os.path.exists(cand):
+            return cand
+    return os.path.join(folder, "%s-%d%s" % (stem, int(time.time()), ext))
+
+
+def same_file_content(path_a, path_b, probe=1048576):
+    """粗判两个文件内容是否相同：先比大小，再比首尾各 1MB（不整文件读，大视频也不卡）。"""
+    try:
+        size = os.path.getsize(path_a)
+        if size != os.path.getsize(path_b):
+            return False
+        with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
+            if fa.read(probe) != fb.read(probe):
+                return False
+            if size <= probe:
+                return True
+            offset = max(0, size - probe)
+            fa.seek(offset)
+            fb.seek(offset)
+            return fa.read(probe) == fb.read(probe)
+    except OSError:
+        return False
+
+
+def copy_into_asset_dir(src, doc_path, suffix=ASSET_DIR_SUFFIX):
+    """把本地图片 / 视频复制进文档资源文件夹，返回 (目标绝对路径, 错误说明)。
+
+    · 文档未保存（doc_path 为空）→ 无法确定资源文件夹，返回空路径 + 原因；
+    · 源文件已在资源文件夹内（重复插入同一张图）→ 直接复用，不生成副本；
+    · 同名文件已存在 → 加 -1 / -2 后缀，绝不覆盖用户已有资源。
+    """
+    folder = doc_asset_dir(doc_path, suffix)
+    if not folder:
+        return "", "文档尚未保存，无法建立资源文件夹"
+    try:
+        src = os.path.abspath(src)
+    except Exception as exc:
+        return "", "源文件路径无效：%s" % exc
+    if not os.path.isfile(src):
+        return "", "源文件不存在：%s" % src
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as exc:
+        return "", "无法创建资源文件夹：%s" % exc
+    try:
+        if os.path.commonpath([os.path.abspath(folder), src]) == os.path.abspath(folder):
+            return src, ""
+    except ValueError:            # 跨盘符：一定不在资源文件夹里
+        pass
+    name = safe_asset_name(src)
+    dst = os.path.join(folder, name)
+    if os.path.isfile(dst) and same_file_content(src, dst):
+        return dst, ""                # 同名同内容：反复插入同一张图 / 同一个视频，直接复用
+    dst = unique_file_path(folder, name)
+    try:
+        shutil.copy2(src, dst)
+    except Exception as exc:
+        return "", "复制到资源文件夹失败：%s" % exc
+    return dst, ""
+
+
+def image_insert_target(path, base_dir=None):
+    """算出写进 Markdown 的图片地址：优先相对文档目录，跨盘用绝对路径，含空格用 <> 包裹。"""
+    return md_local_ref(path, base_dir)
+
+
+def wrap_lines(text, prefix, suffix):
+    """逐行套语法（v1.11.0）：保留每行缩进与行尾空白，空行原样，已包裹的行不重复叠加。
+
+    为什么不能整段套：`**第一行\\n第二行**` 这种跨行强调在 CommonMark 里
+    不成立（`**` 不能跨段落生效），多选几十行点「加粗」等于什么都没加。
+    """
+    out = []
+    # 先把 CRLF / 孤立 CR 统一成 LF：从文件读进来的内容带 \r，直接套语法会把 \r 留在行内
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    for line in normalized.split("\n"):
+        core = line.strip()
+        if not core:
+            out.append(line)
+            continue
+        indent = line[:len(line) - len(line.lstrip())]
+        tail = line[len(line.rstrip()):]
+        if (len(core) >= len(prefix) + len(suffix)
+                and core.startswith(prefix) and core.endswith(suffix)):
+            out.append(line)          # 已经包过，避免 ****文字****
+            continue
+        out.append("%s%s%s%s%s" % (indent, prefix, core, suffix, tail))
+    return "\n".join(out)
 
 
 def html_escape(text):
@@ -1442,16 +1636,12 @@ def bili_embed_src(text):
 
 
 def video_insert_target(path, base_dir=None):
-    """写进 Markdown 的本地视频地址：优先相对文档目录，反斜杠转 /，空格百分号编码。"""
-    target = os.path.abspath(path)
-    base = base_dir or os.getcwd()
-    try:
-        rel = os.path.relpath(target, base)
-    except ValueError:
-        rel = ""
-    if rel and rel != os.pardir and not rel.startswith(".." + os.sep):
-        target = rel
-    return quote(str(target).replace("\\", "/"), safe="/:")
+    """写进 <video src="…"> 的本地视频地址：优先相对文档目录，反斜杠转 /。
+
+    v1.11.0：不再做百分号编码（原来中文名会变成一长串 %E4%B8%AD…），
+    HTML 属性里允许空格与中文原样出现，可读性和第三方编辑器兼容性都更好。
+    """
+    return html_local_ref(path, base_dir)
 
 
 _TAG_HEAD_RE = re.compile(r"^<\s*(?:iframe|video)\b", re.I)
@@ -2555,8 +2745,8 @@ class SettingsWindow(tk.Toplevel):
         self.alive = True
         self.title("设置 · %s" % APP_NAME)
         self.transient(app.root)
-        self.minsize(560, 560)
-        self.resizable(True, False)
+        self.minsize(560, 700)
+        self.resizable(True, True)
         try:
             icon = _asset_path(ICON_MAIN_NAME)
             if icon:
@@ -2566,7 +2756,11 @@ class SettingsWindow(tk.Toplevel):
 
         self._theme_var = tk.StringVar(value=app.theme)
         self._assoc_text = tk.StringVar(value="正在读取当前关联状态…")
-        self._tip_text = tk.StringVar(value="")
+        self._tip_text = tk.StringVar(
+            value="提示：设置项改动会立即生效，并自动写入 settings.json。")
+        # v1.11.1：编辑辅助区块自己的状态行，避免它的操作提示跑到「文件关联」框里
+        self._edit_tip_text = tk.StringVar(
+            value="本区块只影响编辑与插入行为，改完立即生效，无需重启。")
         self._assoc_buttons = []
 
         self._build()
@@ -2576,6 +2770,7 @@ class SettingsWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<Escape>", lambda e: self.on_close())
         self.update_idletasks()
+        self._fit_height()
         self._center_on_parent()
 
     # ---------------- 界面 ----------------
@@ -2625,11 +2820,46 @@ class SettingsWindow(tk.Toplevel):
                                    "取消关联会清理本工具自建的注册表键，并尽量还原原来的打开方式。"
                                    % ASSOC_PROGID),
                     palette, "panel_bg", "hint_fg").pack(fill="x", padx=14, pady=(8, 10))
-        bind_colors(ttk.Label(assoc_box, textvariable=self._tip_text, justify="left",
-                             wraplength=520),
-                    palette, "panel_bg", "muted_fg").pack(fill="x", padx=14, pady=(0, 10))
+        # ③ 编辑辅助（v1.11.0）
+        edit_box = ttk.LabelFrame(outer, text=" 编辑辅助 ")
+        edit_box.pack(fill="x", pady=(12, 0))
+        self._auto_pair_var = tk.BooleanVar(
+            value=bool(self.app.settings.get("auto_pair", True)))
+        ttk.Checkbutton(edit_box,
+                        text="语法自动补全：** 连打成对 / 括号引号成对 / 右符号自动跳过 / "
+                             "列表回车续行 / Tab 缩进",
+                        variable=self._auto_pair_var,
+                        command=self._on_auto_pair_toggle).pack(
+            anchor="w", padx=14, pady=(8, 4))
+        self._copy_assets_var = tk.BooleanVar(
+            value=bool(self.app.settings.get("copy_assets", True)))
+        ttk.Checkbutton(edit_box,
+                        text="插入图片 / 本地视频时复制到文档同级资源文件夹（便于整包分发）",
+                        variable=self._copy_assets_var,
+                        command=self._on_copy_assets_toggle).pack(
+            anchor="w", padx=14, pady=(0, 6))
+        sub_row = ttk.Frame(edit_box)
+        sub_row.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Label(sub_row, text="资源文件夹后缀：").pack(side="left")
+        self._asset_suffix_var = tk.StringVar(value=asset_suffix_of(self.app.settings))
+        ttk.Entry(sub_row, textvariable=self._asset_suffix_var,
+                  width=16).pack(side="left")
+        ttk.Button(sub_row, text="保存后缀", padding=(10, 2),
+                   command=self._on_save_suffix).pack(side="left", padx=8)
+        bind_colors(ttk.Label(edit_box, justify="left", wraplength=520,
+                              text="资源文件夹 = 文档同级目录下的「文档名 + 后缀」，"
+                                   "例如 笔记.md → 笔记.assets/。后缀只允许字母、数字、"
+                                   "点、下划线、短横线（1~32 位）。关掉复制后插入的仍是"
+                                   "原始绝对路径，换台电脑或别的编辑器打开就会看不到图。"),
+                    palette, "panel_bg", "hint_fg").pack(fill="x", padx=14, pady=(0, 6))
+        # v1.11.1：编辑辅助自己的状态提示，紧贴在本区块下方
+        self._edit_tip_label = bind_colors(
+            ttk.Label(edit_box, textvariable=self._edit_tip_text, justify="left",
+                      wraplength=520),
+            palette, "panel_bg", "muted_fg")
+        self._edit_tip_label.pack(fill="x", padx=14, pady=(0, 10))
 
-        # ③ 在线更新
+        # ④ 在线更新
         upd_box = ttk.LabelFrame(outer, text=" 在线更新 ")
         upd_box.pack(fill="x", pady=(12, 0))
         self._auto_update_var = tk.BooleanVar(
@@ -2651,11 +2881,31 @@ class SettingsWindow(tk.Toplevel):
                                    "决定是否到发布页下载。" % UPDATE_REPO),
                     palette, "panel_bg", "hint_fg").pack(fill="x", padx=14, pady=(0, 10))
 
+        # v1.11.1：通用状态行（主题 / 文件关联 / 在线更新 的操作回执）放在窗口底部，
+        # 没有回执时整体收起，不留空白
+        self._tip_label = bind_colors(
+            ttk.Label(outer, textvariable=self._tip_text, justify="left", wraplength=520),
+            palette, "window_bg", "muted_fg")
+
         # 底部
         bottom = bind_colors(ttk.Frame(outer), palette, "window_bg")
+        self._bottom_bar = bottom
         bottom.pack(fill="x", pady=(12, 0))
+        self._tip_label.pack(fill="x", pady=(10, 0), before=bottom)
         ttk.Button(bottom, text="关闭", command=self.on_close,
                    padding=(16, 4)).pack(side="right")
+
+    def _fit_height(self):
+        """按内容实际需要的高度撑开窗口，避免底部状态行被挤成一条线。"""
+        try:
+            need = int(self.winfo_reqheight()) + 12
+            screen_h = int(self.winfo_screenheight())
+            height = min(need, int(screen_h * 0.92))
+            width = max(560, int(self.winfo_reqwidth()), 620)
+            self.minsize(width, height)
+            self.geometry("%dx%d" % (width, height))
+        except Exception:
+            pass
 
     def _center_on_parent(self):
         try:
@@ -2719,6 +2969,35 @@ class SettingsWindow(tk.Toplevel):
         self._tip_text.set(msg.replace("\n", " "))
         self.refresh_assoc_status()
         log_action("设置窗口", "取消 .md 关联结果 %s" % ("成功" if ok else "失败"))
+
+    # ---------------- 编辑辅助（v1.11.0） ----------------
+    def _on_auto_pair_toggle(self):
+        enabled = bool(self._auto_pair_var.get())
+        self.app.settings["auto_pair"] = enabled
+        self.app.save_layout()
+        self._edit_tip_text.set("语法自动补全已%s（写完立刻生效，无需重启）。"
+                                % ("开启" if enabled else "关闭"))
+        log_action("设置窗口", "auto_pair -> %s" % enabled)
+
+    def _on_copy_assets_toggle(self):
+        enabled = bool(self._copy_assets_var.get())
+        self.app.settings["copy_assets"] = enabled
+        self.app.save_layout()
+        self._edit_tip_text.set(
+            "插入资源时%s复制到同级资源文件夹（写完立刻生效）。"
+            % ("会" if enabled else "不再"))
+        log_action("设置窗口", "copy_assets -> %s" % enabled)
+
+    def _on_save_suffix(self):
+        suffix = (self._asset_suffix_var.get() or "").strip()
+        if not ASSET_SUFFIX_RE.match(suffix):
+            self._edit_tip_text.set("后缀不合法：只允许字母、数字、点、下划线、短横线，长度 1~32。")
+            return
+        self.app.settings["asset_suffix"] = suffix
+        self.app.save_layout()
+        self._asset_suffix_var.set(suffix)
+        self._edit_tip_text.set("资源文件夹后缀已保存为「%s」（对之后插入的文件生效）。" % suffix)
+        log_action("设置窗口", "asset_suffix -> %s" % suffix)
 
     # ---------------- 在线更新 ----------------
     def _on_auto_update_toggle(self):
@@ -2860,6 +3139,9 @@ class MdToolApp:
         m_file.add_command(label="另存为...", accelerator="Ctrl+Shift+S",
                            command=self.export_document)
         m_file.add_separator()
+        m_file.add_command(label="整理文档资源（并入 .assets）",
+                           command=self.localize_document_assets)
+        m_file.add_separator()
         m_file.add_command(label="设置...", accelerator="Ctrl+,",
                            command=self.open_settings)
         m_file.add_separator()
@@ -2983,6 +3265,7 @@ class MdToolApp:
             ("图片链接", self.insert_image),
             ("插入图片", self.insert_image_file),
             ("插入视频", self.insert_video),
+            ("整理资源", self.localize_document_assets),
             ("表格", self.insert_table_template),
             ("分割线", self.insert_hr),
         ]
@@ -3606,6 +3889,7 @@ class MdToolApp:
                            lambda e, k=key: self.toggle_panel(k))
         self.editor.bind("<<Modified>>", self._on_editor_modified)
         self.editor.bind("<KeyRelease>", lambda e: self.update_stats())
+        self._bind_editor_keys()
 
     def _on_editor_modified(self, _event=None):
         if self.editor.edit_modified():
@@ -3613,6 +3897,202 @@ class MdToolApp:
             self._sync_dirty_state()
             self.schedule_preview()
             self.update_stats()
+
+    # ---------------- 语法编辑自动补全（v1.11.0） ----------------
+    # 设计取舍：不把编辑器改成富文本，仍旧在纯 Markdown 源码里编辑，只把
+    # 「语法符号成对补全 / 右侧符号自动跳过 / 列表自动续行 / Tab 缩进」这些
+    # 机械动作自动化；多行选区由 wrap_selection 逐行包裹。这样既能像富文本
+    # 那样选一段直接加粗，又保住源码的可控、可迁移、可版本管理。
+    def _auto_pair_enabled(self):
+        return bool(self.settings.get("auto_pair", True))
+
+    def _in_code_context(self, index="insert"):
+        """光标是否在代码块 / 行内代码里：这些位置不做成对补全，免得破坏代码。"""
+        try:
+            before = self.editor.get("%s linestart" % index, index)
+        except tk.TclError:
+            return False
+        core = before.strip()
+        if core.startswith("```") or core.startswith("~~~"):
+            return True
+        return before.count("`") % 2 == 1
+
+    def _char_at(self, index):
+        try:
+            return self.editor.get(index, "%s+1c" % index)
+        except tk.TclError:
+            return ""
+
+    def _prev_text(self, index, count):
+        try:
+            return self.editor.get("%s-%dc" % (index, count), index)
+        except tk.TclError:
+            return ""
+
+    def _move_caret(self, offset=1):
+        try:
+            self.editor.mark_set("insert", "insert+%dc" % offset)
+        except tk.TclError:
+            pass
+        self.editor.see("insert")
+
+    def _has_selection(self):
+        try:
+            return bool(self.editor.tag_ranges("sel"))
+        except tk.TclError:
+            return False
+
+    def _on_pair_key(self, opener, closer):
+        """成对符号：有选区就包裹，无选区自动补右符号，光标后已有右符号则只跳过。"""
+        if not self._auto_pair_enabled():
+            return None
+        if self._has_selection():
+            self.wrap_selection(opener, closer)
+            return "break"
+        if self._in_code_context():
+            return None
+        pos = self.editor.index("insert")
+        if self._char_at(pos) == closer:      # 右符号已在前面 → 光标跳过它
+            self._move_caret(1)
+            return "break"
+        self.editor.insert(pos, opener + closer)
+        self.editor.mark_set("insert", pos)
+        self._move_caret(1)
+        return "break"
+
+    def _on_star_key(self):
+        """* 键：有选区 → 斜体包裹；否则原样插入，不做自动配对。
+
+        为什么不配对 `*`：Markdown 里 `*` 同时是斜体、加粗、无序列表的前缀，
+        自动补半边的结果是手写 `**加粗**` 变成 `****`、行首 `* 列表` 变成 `*  *`。
+        """
+        if not self._auto_pair_enabled():
+            return None
+        if self._has_selection():
+            self.wrap_selection("*", "*")
+            return "break"
+        return None
+
+    def _on_backtick_key(self):
+        """反引号：有选区包裹成行内代码；否则保持原样（不补全，方便手写 ``` 代码块）。"""
+        if not self._auto_pair_enabled():
+            return None
+        if self._has_selection():
+            self.wrap_selection("`", "`")
+            return "break"
+        return None
+
+    def _on_close_key(self, ch):
+        """右括号 / 引号：光标后正好是它时只把光标移过去，不再多打一个。"""
+        if not self._auto_pair_enabled():
+            return None
+        if self._char_at(self.editor.index("insert")) == ch:
+            self._move_caret(1)
+            return "break"
+        return None
+
+    def _on_enter_key(self):
+        """回车续写列表 / 引用；空条目再回车则去掉标记、退出列表。"""
+        if not self._auto_pair_enabled() or self._has_selection():
+            return None
+        try:
+            line = self.editor.get("insert linestart", "insert")
+            tail = self.editor.get("insert", "insert lineend")
+        except tk.TclError:
+            return None
+        if tail.strip():                      # 只在行尾回车时续写，避免把一行劈成两半
+            return None
+        if self._in_code_context():
+            return None
+        match = _AUTO_LIST_RE.match(line)
+        if match:
+            indent, bullet = match.group(1), match.group(2)
+            space = match.group(3) or " "
+            task = match.group(4) or ""
+            if not line[match.end():].strip():
+                self.editor.delete("insert linestart", "insert")
+                return "break"
+            self.editor.insert("insert", "\n" + indent + bullet + space
+                               + ("[ ] " if task else ""))
+            self.editor.see("insert")
+            return "break"
+        match = _AUTO_ORDER_RE.match(line)
+        if match:
+            indent, number, dot = match.group(1), int(match.group(2)), match.group(3)
+            space = match.group(4) or " "
+            task = match.group(5) or ""
+            if not line[match.end():].strip():
+                self.editor.delete("insert linestart", "insert")
+                return "break"
+            self.editor.insert("insert", "\n%s%d%s%s%s"
+                               % (indent, number + 1, dot, space,
+                                  "[ ] " if task else ""))
+            self.editor.see("insert")
+            return "break"
+        match = _AUTO_QUOTE_RE.match(line)
+        if match:
+            if not line[match.end():].strip():
+                self.editor.delete("insert linestart", "insert")
+                return "break"
+            self.editor.insert("insert", "\n%s%s " % (match.group(1), match.group(2)))
+            self.editor.see("insert")
+            return "break"
+        return None
+
+    def _indent_lines(self, outdent=False):
+        """多行缩进 / 反缩进（两个空格为一级），保住选区方便连续操作。"""
+        try:
+            ranges = self.editor.tag_ranges("sel")
+            if ranges:
+                start, end = ranges[0], ranges[1]
+            else:
+                start, end = "insert linestart", "insert lineend"
+            text = self.editor.get(start, end)
+        except tk.TclError:
+            return None
+        lines = []
+        for line in text.split("\n"):
+            if not line.strip():
+                lines.append(line)
+            elif outdent:
+                if line.startswith(AUTO_INDENT):
+                    lines.append(line[len(AUTO_INDENT):])
+                elif line[:1] in (" ", "\t"):
+                    lines.append(line[1:])
+                else:
+                    lines.append(line)
+            else:
+                lines.append(AUTO_INDENT + line)
+        new_text = "\n".join(lines)
+        self._replace_range(start, end, new_text, select=(0, len(new_text)))
+        return "break"
+
+    def _on_tab_key(self):
+        return self._indent_lines(outdent=False)
+
+    def _on_shift_tab_key(self):
+        return self._indent_lines(outdent=True)
+
+    def _bind_editor_keys(self):
+        """编辑器按键增强绑定：全部返回 "break" 的走自行插入，返回 None 的交给默认处理。"""
+        ed = self.editor
+        ed.bind("<KeyPress-asterisk>", lambda e: self._on_star_key())
+        ed.bind("<KeyPress-bracketleft>", lambda e: self._on_pair_key("[", "]"))
+        ed.bind("<KeyPress-braceleft>", lambda e: self._on_pair_key("{", "}"))
+        ed.bind("<KeyPress-parenleft>", lambda e: self._on_pair_key("(", ")"))
+        ed.bind("<KeyPress-quotedbl>", lambda e: self._on_pair_key('"', '"'))
+        ed.bind("<KeyPress-bracketright>", lambda e: self._on_close_key("]"))
+        ed.bind("<KeyPress-braceright>", lambda e: self._on_close_key("}"))
+        ed.bind("<KeyPress-parenright>", lambda e: self._on_close_key(")"))
+        ed.bind("<KeyPress-grave>", lambda e: self._on_backtick_key())
+        ed.bind("<Return>", lambda e: self._on_enter_key())
+        ed.bind("<Tab>", lambda e: self._on_tab_key())
+        ed.bind("<Shift-Tab>", lambda e: self._on_shift_tab_key())
+        ed.bind("<Control-b>", lambda e: (self.wrap_selection("**", "**", "加粗文字"),
+                                          "break")[1])
+        ed.bind("<Control-i>", lambda e: (self.wrap_selection("*", "*", "斜体文字"),
+                                          "break")[1])
+        ed.bind("<Control-k>", lambda e: (self.insert_link(), "break")[1])
 
     # ---------------- 预览与统计 ----------------
     def schedule_preview(self, delay=220):
@@ -4167,10 +4647,19 @@ class MdToolApp:
         self.update_stats()
 
     def wrap_selection(self, prefix, suffix, placeholder=""):
+        """按语法包裹选区；多行选区逐行包裹（v1.11.0 修）。"""
         self.editor.focus_set()
         sel = self._editor_selection()
         if sel:
             start, end, selected = sel
+            if "\n" in selected:
+                # 多行：整段只加一个首尾符号等于没加（跨行强调不生效），改成逐行包裹
+                new_text = wrap_lines(selected, prefix, suffix)
+                self._replace_range(start, end, new_text,
+                                    select=(0, len(new_text)))
+                log_action("语法插入", "多行逐行包裹 %s（%d 行）"
+                           % (prefix, len(selected.split("\n"))))
+                return
             # 包裹后仍选中原文内部，便于继续叠加其它语法
             self._replace_range(start, end, prefix + selected + suffix,
                                 select=(len(prefix),
@@ -4264,34 +4753,94 @@ class MdToolApp:
         self._editor_insert("![图片说明](https://example.com/image.png)")
         log_action("语法插入", "图片链接")
 
+    def _doc_base_dir(self):
+        """当前文档所在目录（未保存返回空串）：插入资源时算相对路径的基准。"""
+        if not self.current_file:
+            return ""
+        try:
+            return os.path.dirname(os.path.abspath(self.current_file))
+        except Exception:
+            return ""
+
+    def _asset_ref(self, path):
+        """把本地资源接进文档前先落到资源文件夹，返回 (用于写进文档的绝对路径, 提示)。"""
+        suffix = asset_suffix_of(self.settings)
+        if not self.settings.get("copy_assets", True):
+            return path, ""
+        if not self.current_file:
+            return path, "文档尚未保存，先用原路径引用；保存后可点「整理资源」自动迁移"
+        dst, err = copy_into_asset_dir(path, self.current_file, suffix)
+        if dst:
+            return dst, ""
+        log_action("资源复制失败", "%s | %s" % (path, err))
+        return path, err or "复制到资源文件夹失败"
+
+    def _insert_block(self, markup):
+        """块级插入：前后按需补空行，避免图片/视频标记粘在上一行文字后面。"""
+        text = markup
+        try:
+            before = self.editor.get("insert linestart", "insert")
+            after = self.editor.get("insert", "insert lineend")
+        except tk.TclError:
+            before = after = ""
+        if before.strip():
+            text = "\n" + text
+        if after.strip():
+            text = text + "\n"
+        self._editor_insert(text)
+        self.editor.see("insert")
+        return text
+
     def insert_image_file(self):
-        """选择本地图片并插入 ![说明](路径)；路径优先相对当前文档目录（v1.7.0）。"""
-        initial = os.getcwd()
-        base_dir = ""
-        if self.current_file:
-            try:
-                base_dir = os.path.dirname(os.path.abspath(self.current_file))
-                initial = base_dir
-            except Exception:
-                base_dir = ""
-        path = filedialog.askopenfilename(
-            parent=self.root, title="选择要插入的图片", initialdir=initial,
+        """插入本地图片：支持多选，默认把图片复制到文档同名资源文件夹（v1.11.0）。
+
+        为什么改：以前只写「相对文档目录」的路径，图片一旦在别的文件夹，
+        文档连同图片发给别人（或换一个 Markdown 编辑器打开）就显示不出来。
+        现在把图片复制进 <文档名>.assets，文档里只写该文件夹内的相对路径。
+        """
+        initial = self._doc_base_dir() or os.getcwd()
+        picked = filedialog.askopenfilenames(
+            parent=self.root, title="选择要插入的图片（可多选）", initialdir=initial,
             filetypes=[("图片文件", " ".join("*" + ext for ext in IMAGE_EXTENSIONS)),
                        ("所有文件", "*.*")])
-        if not path:
+        if not picked:
             log_action("语法插入", "插入本地图片（已取消）")
             return
-        target = image_insert_target(path, base_dir)
-        alt = os.path.splitext(os.path.basename(path))[0]
+        if isinstance(picked, str):
+            picked = [picked]
+        base_dir = self._doc_base_dir()
         sel = self._editor_selection()
-        if sel:
-            start, end, selected = sel
-            self._replace_range(start, end, "![%s](%s)" % (selected, target))
-            log_action("语法插入", "插入本地图片（选中文本作说明）%s" % path)
-            return
-        self._editor_insert("![%s](%s)" % (alt, target))
-        log_action("语法插入", "插入本地图片 %s" % path)
-        self.status_var.set("已插入图片：%s" % os.path.basename(path))
+        alt_text = sel[2].strip().replace("\n", " ") if sel else ""
+        blocks = []
+        notes = []
+        copied = 0
+        for idx, path in enumerate(picked):
+            path = os.path.abspath(path)
+            final, note = self._asset_ref(path)
+            if note:
+                notes.append(note)
+            if final != path:
+                copied += 1
+            alt = (alt_text if (idx == 0 and alt_text) else
+                   os.path.splitext(os.path.basename(path))[0])
+            alt = alt.replace("[", "［").replace("]", "］")
+            blocks.append("![%s](%s)" % (alt, md_local_ref(final, base_dir)))
+        markup = "\n\n".join(blocks)
+        if sel and len(picked) == 1:
+            self._replace_range(sel[0], sel[1], markup)
+        else:
+            self._insert_block(markup)
+        log_action("语法插入", "插入本地图片 %d 张（复制 %d 张到资源文件夹）| %s"
+                   % (len(picked), copied, "；".join(notes) if notes else "正常"))
+        if notes:
+            self.status_var.set("已插入 %d 张图片（%s）" % (len(picked), notes[0]))
+        else:
+            self.status_var.set("已插入 %d 张图片，资源已并入 %s"
+                                % (len(picked),
+                                   os.path.basename(doc_asset_dir(
+                                       self.current_file,
+                                       asset_suffix_of(self.settings)))
+                                   or "资源文件夹"))
 
     def insert_video(self):
         """插入视频（v1.8.1）：剪贴板里是干净的视频内容才直接采纳，否则弹多行输入框。
@@ -4300,6 +4849,8 @@ class MdToolApp:
         用户复制的聊天或文档文字会被当成视频插进来（表现为"插入视频不好使"）。
         """
         base_dir = ""
+        notes = []
+        weak = []
         if self.current_file:
             try:
                 base_dir = os.path.dirname(os.path.abspath(self.current_file))
@@ -4341,31 +4892,56 @@ class MdToolApp:
                     return
                 source = "手动输入"
             else:
-                path = filedialog.askopenfilename(
-                    parent=self.root, title="选择要插入的视频",
+                picked = filedialog.askopenfilenames(
+                    parent=self.root, title="选择要插入的视频（可多选）",
                     initialdir=base_dir or os.getcwd(),
                     filetypes=[("视频文件",
                                 " ".join("*" + ext for ext in VIDEO_EXTENSIONS)),
                                ("所有文件", "*.*")])
-                if not path:
+                if not picked:
                     log_action("语法插入", "插入本地视频（已取消）")
                     return
-                markup = build_video_markup(path, base_dir)
-                if not markup:
+                if isinstance(picked, str):
+                    picked = [picked]
+                # v1.11.0：本地视频同样并入文档资源文件夹，文档只写文件夹内相对路径，
+                # 整包发出去不会因为绝对路径失效而播不了。
+                marks = []
+                copied = 0
+                notes = []
+                weak = []
+                for item in picked:
+                    item = os.path.abspath(item)
+                    final, note = self._asset_ref(item)
+                    if note:
+                        notes.append(note)
+                    if final != item:
+                        copied += 1
+                    if item.lower().endswith(VIDEO_WEAK_EXTS):
+                        weak.append(os.path.basename(item))
+                    one = build_video_markup(final, base_dir)
+                    if one:
+                        marks.append(one)
+                if not marks:
                     messagebox.showwarning(APP_NAME, "无法生成视频标记，请检查文件。",
                                            parent=self.root)
                     return
-                source = "本地文件"
+                markup = "\n\n".join(marks)
+                source = "本地文件 %d 个（复制 %d 个到资源文件夹）" % (len(picked), copied)
         ranges = self.editor.tag_ranges("sel")
         if ranges:
             self._replace_range(ranges[0], ranges[1], markup,
                                 caret_offset=len(markup))
         else:
-            self._editor_insert(markup)
-            self.editor.see("insert")
+            self._insert_block(markup)
         log_action("语法插入", "插入视频（%s）%.60s"
                    % (source, markup.replace("\n", " ")))
-        self.status_var.set("已插入视频（来源：%s），点预览里的「▶」即可播放" % source)
+        tip = "已插入视频（来源：%s），点预览里的「▶」即可播放" % source
+        if notes:
+            tip = "已插入视频，但%s" % notes[0]
+        elif weak:
+            tip = ("已插入视频，但 %s 这类格式 Chromium 内核播不了，预览会黑屏，"
+                   "建议先转成 mp4 再插入" % "、".join(weak[:2]))
+        self.status_var.set(tip)
 
     def _ask_video_text(self, initial="", clip_rejected=False):
         """多行"插入视频"输入框：粘贴多行 iframe 不会被单行框挤成一行。
@@ -4431,6 +5007,122 @@ class MdToolApp:
         win.grab_set()
         win.wait_window()
         return result["value"]
+
+    def localize_document_assets(self):
+        """一键整理：把文档引用的本地图片 / 视频统一收进 <文档名>.assets 并改写路径。
+
+        用途场景：文档是别处写好的、或历史上插的是别处文件夹的图片，
+        点一下这个，全部资源挪进文档旁边的资源文件夹，整个文件夹直接打包发给别人。
+        只处理真实存在的本地文件；网络图、data:、BASE64 与找不到的文件原样保留。
+        """
+        self._sync_dirty_state()
+        if not self.current_file:
+            messagebox.showinfo(
+                APP_NAME,
+                "请先保存文档再整理资源。\n\n"
+                "资源文件夹是跟着文档走的（<文档名>.assets），"
+                "没有文档路径就不知道往哪儿放。",
+                parent=self.root)
+            return
+        base_dir = self._doc_base_dir()
+        suffix = asset_suffix_of(self.settings)
+        folder = doc_asset_dir(self.current_file, suffix)
+        content = self.editor.get("1.0", "end-1c").replace("\r\n", "\n")
+        stats = {"moved": 0, "kept": 0, "failed": 0}
+
+        def resolve(ref):
+            """把文档里的地址还原成本地绝对路径；非本地地址返回空。"""
+            text = (ref or "").strip()
+            if text.startswith("<") and text.endswith(">"):
+                text = text[1:-1].strip()
+            if not text:
+                return ""
+            low = text.lower()
+            if low.startswith(("http://", "https://", "data:", "mailto:",
+                               "ftp://", "//")):
+                return ""
+            if low.startswith("file:///"):
+                text = unquote(text[8:])
+            elif low.startswith("file://"):
+                text = unquote(text[7:])
+            if os.path.isabs(text):
+                return os.path.abspath(text)
+            return os.path.abspath(os.path.join(base_dir, text.replace("/", os.sep)))
+
+        def relocate(path):
+            """复制进资源文件夹，返回 (目标绝对路径, 是否为新复制)。"""
+            dst, err = copy_into_asset_dir(path, self.current_file, suffix)
+            if not dst:
+                stats["failed"] += 1
+                log_action("整理资源失败", "%s | %s" % (path, err))
+                return ""
+            if os.path.abspath(dst) == os.path.abspath(path):
+                stats["kept"] += 1
+            else:
+                stats["moved"] += 1
+            return dst
+
+        def sub_md(match):
+            head, ref, tail = match.group(1), match.group(2), match.group(3)
+            path = resolve(ref)
+            if not path or not os.path.isfile(path):
+                return match.group(0)
+            dst = relocate(path)
+            if not dst:
+                return match.group(0)
+            return head + md_local_ref(dst, base_dir) + tail
+
+        def sub_html(match):
+            head, ref, tail = match.group(1), match.group(2), match.group(3)
+            path = resolve(ref)
+            if not path or not os.path.isfile(path):
+                return match.group(0)
+            dst = relocate(path)
+            if not dst:
+                return match.group(0)
+            return head + html_local_ref(dst, base_dir) + tail
+
+        new_content = _ASSET_MD_IMAGE_RE.sub(sub_md, content)
+        new_content = _ASSET_HTML_SRC_RE.sub(sub_html, new_content)
+        if new_content == content:
+            self.status_var.set("无需整理：文档里没有可迁移的本地图片 / 视频")
+            messagebox.showinfo(
+                APP_NAME,
+                "文档里没有需要迁移的本地图片 / 视频。\n\n"
+                "（已经是资源文件夹内的相对路径，或者是网络地址）",
+                parent=self.root)
+            log_action("整理资源", "无变更")
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                "将把文档引用的本地资源复制进：\n%s\n\n"
+                "并把正文里的路径改写为该文件夹内的相对路径。\n"
+                "原文件不会被删除或移动，确认继续？" % folder,
+                parent=self.root):
+            log_action("整理资源", "用户取消")
+            return
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", new_content)
+        self.editor.edit_reset()
+        self.editor.mark_set("insert", "1.0")
+        self._last_selection = None
+        self._sync_dirty_state()
+        self.schedule_preview()
+        self.update_stats()
+        log_action("整理资源", "迁移 %d 个，复用 %d 个，失败 %d 个 | %s"
+                   % (stats["moved"], stats["kept"], stats["failed"], folder))
+        messagebox.showinfo(
+            APP_NAME,
+            "资源整理完成。\n\n"
+            "· 新复制：%d 个\n"
+            "· 已在资源文件夹（复用）：%d 个\n"
+            "· 失败：%d 个\n\n"
+            "资源文件夹：\n%s\n\n"
+            "记得按 Ctrl+S 保存文档，之后整个文件夹可以直接打包发给别人。"
+            % (stats["moved"], stats["kept"], stats["failed"], folder),
+            parent=self.root)
+        self.status_var.set("资源整理完成：新复制 %d 个，路径已改写为相对路径"
+                            % stats["moved"])
 
     def insert_table_template(self):
         sel = self._editor_selection()

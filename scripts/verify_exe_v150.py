@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """v1.5.0 exe 端到端验证：单实例转交 + 标题切换 + 无残留进程。"""
 import ctypes
 import ctypes.wintypes as wt
@@ -12,6 +12,18 @@ import time
 EXE = r"E:\yscl\MdCmdTool\爽哥MD编辑工具.exe"
 NAME = "爽哥MD编辑工具.exe"
 PASS, FAIL = [], []
+# v1.11.0：版本号从主源码 dynamic 读取，避免每次发版都要改校验脚本
+def _read_app_ver():
+    import os
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "爽哥MD命令生成工具.py"),
+                  encoding="utf-8-sig").read()
+    hit = re.search(r'APP_VERSION\s*=\s*"([\d.]+)"', src)
+    return hit.group(1) if hit else "0.0.0"
+
+
+APP_VER = _read_app_ver()
 
 
 def ok(name, cond, extra=""):
@@ -80,7 +92,7 @@ def main():
     pids = pids_of(NAME)
     ok("首个实例已启动", len(pids) >= 1, str(pids))
     t = app_titles(set(pids)) if pids else []
-    ok("窗口标题含版本号", any("v1.5.0" in x for x in t), str(t))
+    ok("窗口标题含版本号", any(("v%s" % APP_VER) in x for x in t), str(t))
     ok("窗口标题含 t1.md", any("t1.md" in x for x in t), str(t))
     ok("标题无未保存标记", all(not x.endswith("*") for x in t), str(t))
 
